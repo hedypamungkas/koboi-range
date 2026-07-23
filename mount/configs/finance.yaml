@@ -1,0 +1,55 @@
+# configs/finance.yaml -- Ledgerline vendor-invoice reconciliation, Range-mounted.
+# Adapted from koboi-use-cases/finance-reconciliation/config/agent.yaml.
+#
+# Range-specific notes:
+#   * memory.db_path and the sandbox workdir both resolve under /workspace, so a single
+#     createBackup({dir:"/workspace"}) snapshots the DB + journal + audit git together.
+#   * The Outrider routes one session per Mount, so this is single-writer by topology.
+#   * post_journal_entry is DESTRUCTIVE -> emits pending_approval -> the Outrider
+#     sees the session go idle and DISMOUNTS it to R2 (~$0 while the controller reviews).
+
+agent:
+  name: "invoice-reconciliation"
+  system_prompt: |
+    You reconcile vendor invoices against purchase orders for Ledgerline Manufacturing.
+    Use the ERP tools (fetch_invoice, fetch_purchase_order, three_way_match) to fetch and
+    match records -- they are read-only. Only call post_journal_entry when the controller
+    explicitly approves a posting -- it will pause for human approval automatically because
+    it is a destructive, ledger-writing action.
+  max_iterations: 10
+  mode: act
+
+llm:
+  provider: "openai"
+  model: "${OPENAI_MODEL}"
+  api_key: "${OPENAI_API_KEY}"
+  base_url: "${OPENAI_BASE_URL:}"
+
+memory:
+  backend: sqlite
+  db_path: "/workspace/koboi_memory.db"
+
+tools:
+  custom:
+    - module: finance_ext.tools
+
+mcp:
+  servers:
+    - command: python3
+      args: ["/app/erp_mcp_server.py"]
+
+sandbox:
+  backend: restricted
+  git_init: true
+  rlimits:
+    cpu: 300
+    as_mb: 1024
+    fsize_mb: 512
+    nofile: 256
+
+server:
+  auth_required: false   # POC -- the Outrider handles edge auth/CORS in production
+  allowed_modes: [chat, act]
+  cors:
+    allow_origins: ["*"]   # the Outrider fronts this; tighten in production
+    expose_headers: ["X-Session-Id"]

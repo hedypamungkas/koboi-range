@@ -1,0 +1,18 @@
+# Node / wrangler
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+
+# Python (vendored use-case)
+__pycache__/
+*.pyc
+.venv/
+
+# env / secrets -- NEVER commit
+.env
+.env.*
+!.env.example
+
+# editor
+.DS_Store

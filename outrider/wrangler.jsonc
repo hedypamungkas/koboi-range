@@ -1,0 +1,49 @@
+// Outrider wrangler config. Bindings mirror the Cloudflare Sandbox SDK guide
+// (https://developers.cloudflare.com/sandbox/guides/backup-restore/).
+//
+// VERIFY at first deploy:
+//   - containers[].image path (relative to this file -> "../mount")
+//   - the KV namespace id (create one: `wrangler kv namespace create RANGE_KV`)
+//   - CLOUDFLARE_ACCOUNT_ID + the R2 bucket exists (`wrangler r2 bucket create range-saddlebags`)
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "koboi-range-outrider",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-21",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The Mount image: a `Sandbox` class that is BOTH a containers binding (the image)
+  // AND a durable_objects binding (the per-session coordinator the SDK drives).
+  "containers": [
+    { "class_name": "Sandbox", "image": "../mount" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "Sandbox", "name": "Sandbox" }
+    ]
+  },
+  "migrations": [
+    { "new_sqlite_classes": ["Sandbox"], "tag": "v1" }
+  ],
+
+  // RANGE_KV = the session registry (status + Saddlebag handles).
+  "kv_namespaces": [
+    { "binding": "RANGE_KV", "id": "<replace: wrangler kv namespace create RANGE_KV>" }
+  ],
+
+  // BACKUP_BUCKET = where createBackup() writes the squashfs Saddlebags.
+  "r2_buckets": [
+    { "binding": "BACKUP_BUCKET", "bucket_name": "range-saddlebags" }
+  ],
+
+  "vars": {
+    "BACKUP_BUCKET_NAME": "range-saddlebags",
+    "CLOUDFLARE_ACCOUNT_ID": "<YOUR_ACCOUNT_ID>",
+    "MOUNT_CONFIG": "/app/config/finance.yaml"
+  },
+
+  // The Range heartbeat -- 1/min, same cadence as the Devin Outposts template.
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "koboi-range-outrider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outrider -- edge coordinator for koboi-range: per-session Mount lifecycle + Saddlebag suspend/resume on Cloudflare.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "^0.12.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.113.0"
+  }
+}
