@@ -1,57 +1,41 @@
-# mount/Dockerfile -- "the Mount": a single-session koboi server container.
+# mount/Dockerfile -- the Mount: a Sandbox-SDK container running a single-session koboi server.
 #
-# One Mount is drawn per agent session (named by session id) by the Outrider.
-# Mirrors the proven image in koboi-use-cases/finance-reconciliation/backend/Dockerfile.
-# Build context = this `mount/` directory (see outrider/wrangler.jsonc -> containers[].image).
-FROM python:3.12-slim
+# ROOT-CAUSE FIX (RC2): the image MUST derive from the Sandbox SDK base image
+# (docker.io/cloudflare:sandbox:<sdk-version>) -- it ships the in-container agent that implements
+# exec / createBackup / startProcess / waitForPort. A plain python:* image lacks it, so every SDK
+# RPC hangs (the container "runs" but has nothing to answer the SDK). Do NOT set CMD -- inherit the
+# base image's entrypoint (the agent); `koboi serve` is started by the Outrider via startProcess.
+FROM docker.io/cloudflare/sandbox:0.12.4
 
-# Pin to the latest koboi-agent released on PyPI (>=0.18.2). Bump to match the
-# version you actually want to ride on the Range.
-ARG KOBOI_AGENT_VERSION=0.19.1
-
-WORKDIR /app
-
-# git: sandbox.git_init seeds each session workdir as a git repo (audit trail) -- needs the binary.
-# procps: the Outrider stops `koboi serve` via `pkill -TERM -f 'koboi serve'` on dismount (slim
-# images don't ship procps by default).
+# git: sandbox.git_init seeds each session workdir as a git repo (audit trail).
+# procps: the Outrider stops `koboi serve` via `pkill -TERM -f 'koboi serve'` on dismount.
+# python3 + python3-pip: the 0.12.4 SDK base ships Python but does NOT put python3/pip on PATH,
+# so install them via apt to get a working `python3 -m pip` (koboi needs >=3.10).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git procps \
+ && apt-get install -y --no-install-recommends git procps python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir "koboi-agent[api]==${KOBOI_AGENT_VERSION}"
+# koboi-agent 0.19.1 (has POST /v1/sessions/{id}/suspend + SQLiteMemory.consistent_backup).
+ARG KOBOI_AGENT_VERSION=0.19.1
+RUN python3 -m pip install --no-cache-dir "koboi-agent[api]==${KOBOI_AGENT_VERSION}"
 
 # --- use-case code (demo: Ledgerline invoice reconciliation) -----------------
-# In a real Range deploy these come from YOUR repo. Vendored here so the Wave-0
-# image builds and runs end-to-end. finance-ext provides the tools + the stdio
-# ERP MCP server referenced by configs/finance.yaml.
-COPY usecase/finance-ext/pyproject.toml ./pyproject.toml
+# finance-ext has no deps + no compiled code, so put it on PYTHONPATH instead of pip-installing
+# (avoids needing the PEP 517 build backend, which the apt python3-pip doesn't ship).
+WORKDIR /app
 COPY usecase/finance-ext/src ./src
 COPY usecase/finance-ext/erp_mcp_server.py ./erp_mcp_server.py
-RUN pip install --no-cache-dir -e .
+ENV PYTHONPATH=/app/src
 
-# koboi config (single-session, /workspace as the snapshotted root).
+# koboi config (single-session, /workspace as the snapshotted Saddlebag root).
 COPY configs/finance.yaml /app/config/finance.yaml
 
-# /workspace is the "Saddlebag" root: koboi_memory.db (WAL) + steps journal + audit git
-# all live here, so ONE createBackup({dir:"/workspace"}) captures the whole ride.
-# .dockerkeep keeps /workspace non-empty so the image seeds it non-root-owned (matches
-# the upstream .dockerkeep trick -- empty dirs are skipped and would break USER app writes).
-RUN useradd --create-home --uid 1000 app \
- && mkdir -p /workspace && touch /workspace/.dockerkeep \
- && chown -R app:app /app /workspace
-
-USER app
-# Runtime cwd = /workspace so koboi's default sandbox workdir (".") resolves under
-# the Saddlebag root and gets captured by createBackup({dir:"/workspace"}).
-WORKDIR /workspace
-EXPOSE 8000
+# /workspace is the "Saddlebag" root: koboi_memory.db (WAL) + steps journal + audit git all live
+# here, so ONE createBackup({dir:"/workspace"}) captures the whole ride.
+RUN mkdir -p /workspace
 
 ENV KOBOI_CONFIG=/app/config/finance.yaml
-# Point the finance audit log under the Saddlebag root so it rides createBackup
-# (finance_ext/hooks.py defaults to /data/audit -- outside the snapshot root).
+# Point the finance audit log under the Saddlebag root so it rides createBackup.
 ENV INVOICE_AUDIT_LOG=/workspace/audit/invoice_audit.jsonl
-# Keep-alive: the Outrider OWNS the `koboi serve` lifecycle (startProcess after
-# restore+swap; pkill before restore). koboi serve opens the shared SQLite DB EAGERLY
-# in create_app (pre-lifespan) + resume_on_startup at lifespan startup, so the resume-side
-# snapshot swap MUST happen before it starts -- a self-starting CMD would cause split-brain.
-CMD ["sleep", "infinity"]
+EXPOSE 8000
+# NO CMD: inherit the Sandbox SDK base image entrypoint (the in-container agent).

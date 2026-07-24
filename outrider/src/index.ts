@@ -13,7 +13,7 @@
 import type { Env } from "./lib/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
 
-import { ride, createSession, dismount, remount, retire, sessionMessages } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
 const IDLE_THRESHOLD_MS = 60_000;
@@ -25,7 +25,7 @@ export default {
     if (url.pathname === "/healthz") return json({ service: "koboi-range-outrider", status: "ok" });
 
     const m = url.pathname.match(
-      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages)\/([^/]+)$/,
+      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages|ping|reconcile)\/([^/]+)$/,
     );
     if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env);
 
@@ -68,6 +68,12 @@ export default {
 
 async function handleLifecycle(action: string, sid: string, req: Request, env: Env): Promise<Response> {
   switch (action) {
+    case "ping": {
+      return json({ sid, action: "ping", pong: await pingMount(env, sid) });
+    }
+    case "reconcile": {
+      return json({ sid, action: "reconcile", reconcile: await runReconcile(env, sid) });
+    }
     case "ride": {
       const existing = await reg.get(env, sid);
       await ride(env, sid, existing?.saddlebag ?? null);

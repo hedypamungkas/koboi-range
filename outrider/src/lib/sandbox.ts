@@ -147,3 +147,22 @@ export async function retire(env: Env, sessionId: string, saddlebag?: DirectoryB
   }
   return { retired: true, sessionId, hadSaddlebag: Boolean(saddlebag) };
 }
+
+/** PROOF: `echo hi` via SDK exec -- the RC2 isolation diagnostic (does container RPC respond?). */
+export async function pingMount(env: Env, sid: string): Promise<string> {
+  const r = await mount(env, sid).exec("echo hi", { timeout: 15000 });
+  return (r.stdout || "").trim();
+}
+
+/** PROOF: run the finance reconcile INSIDE the Mount via `koboi run` (the real LLM call happens
+ *  in-container). Non-interactive CLI run; returns the agent's reconcile result via exec stdout. */
+export async function runReconcile(
+  env: Env,
+  sid: string,
+  message = "Reconcile invoice INV-8842 against PO-4471 using the ERP tools "
+    + "(fetch_invoice, fetch_purchase_order, three_way_match) and report the result.",
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const safe = message.replace(/'/g, `'\\''`); // single-quote-escape for the shell -m arg
+  const r = await mount(env, sid).exec(`koboi run ${mountConfig(env)} -m '${safe}'`, { timeout: 180000 });
+  return { exitCode: r.exitCode, stdout: r.stdout || "", stderr: (r.stderr || "").slice(0, 1000) };
+}

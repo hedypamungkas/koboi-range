@@ -16,3 +16,6 @@ __pycache__/
 
 # editor
 .DS_Store
+
+# Python build artifact (vendored finance-ext local pip install)
+*.egg-info/
