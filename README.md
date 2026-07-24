@@ -176,6 +176,25 @@ npx wrangler deploy
 
 ---
 
+## Developing & testing
+
+The Outrider has a local test suite that runs **without a Cloudflare account or deploy** —
+the per-session Mount (Cloudflare Container) is mocked, while the registry + the cron heartbeat
+run against real ephemeral KV (Miniflare). A real ride (live `koboi serve` in a live Container)
+still needs a Paid CF account + deploy (see [Deploy](#deploy-wave-0-proof)).
+
+```bash
+cd outrider
+npm ci
+npm run typecheck   # tsc --noEmit over src/ (the ship gate)
+npm test            # vitest: 17 tests across registry / routing / lifecycle / scheduled
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and [docs/ROADMAP.md](docs/ROADMAP.md)
+for the Wave-0 → Wave-1b TODO list.
+
+---
+
 ## Honest caveats (Wave-0)
 
 - **Not deployable blind.** Needs `npm install`, a CF account, KV + R2 created, secrets set,

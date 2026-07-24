@@ -27,8 +27,10 @@
   ],
 
   // RANGE_KV = the session registry (status + Saddlebag handles).
+  // 👇 REQUIRED before first deploy: create the namespace and paste its id here
+  //     npx wrangler kv namespace create RANGE_KV
   "kv_namespaces": [
-    { "binding": "RANGE_KV", "id": "<replace: wrangler kv namespace create RANGE_KV>" }
+    { "binding": "RANGE_KV", "id": "<replace-with-kv-namespace-id>" }
   ],
 
   // BACKUP_BUCKET = where createBackup() writes the squashfs Saddlebags.

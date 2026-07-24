@@ -1,0 +1,14 @@
+{
+  // Type-check scope for the test suite only. The production typecheck (npm run typecheck)
+  // still uses ../tsconfig.json (src/** only); this lets editors + an optional `tsc -p test`
+  // resolve cloudflare:test + the Workers env without polluting the ship-time check.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"]
+  },
+  "files": [
+    "../node_modules/@cloudflare/vitest-pool-workers/types/cloudflare-test.d.ts"
+  ],
+  "include": ["**/*.ts", "../src/**/*.ts"]
+}

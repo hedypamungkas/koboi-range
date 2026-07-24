@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  outrider:
+    name: Outrider (typecheck + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outrider
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: outrider/package-lock.json
+      - run: npm ci
+      # ship gate: tsc --noEmit over src/
+      - run: npm run typecheck
+      # local suite (Miniflare KV + mocked Mount) -- no Cloudflare account needed
+      - run: npm test

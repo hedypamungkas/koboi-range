@@ -28,7 +28,7 @@ curl -fsS -X POST "$OUTRIDER/lifecycle/observe/$SID" \
   -d '{"status":"awaiting_human"}' | tee /dev/stderr >/dev/null
 get
 
-say "t2 — DISMOUNT: snapshot /data -> R2 Saddlebag, Mount scales to zero (~\$0)"
+say "t2 — DISMOUNT: snapshot /workspace -> R2 Saddlebag, Mount scales to zero (~\$0)"
 curl -fsS -X POST "$OUTRIDER/lifecycle/dismount/$SID" | tee /dev/stderr >/dev/null
 get
 say "    ...session now off the Range. Imagine the controller reviewing overnight..."
