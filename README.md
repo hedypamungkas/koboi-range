@@ -23,8 +23,7 @@ are snapshotted to object storage and pay ~nothing, then resume exactly where th
 
 This is the same deployment pattern as **Devin Outposts** (per-session container, queue-driven
 scale-to-zero, suspend/resume via FS snapshot) — but the agent **brain is yours** (open Python,
-BYO-LLM), not a closed vendor cloud. See the feasibility study that motivates this repo:
-[`koboi-agent/docs/devin-outposts-feasibility.md`](../koboi-agent/docs/devin-outposts-feasibility.md).
+BYO-LLM), not a closed vendor cloud.
 
 > **Wave-0 status — proof scaffold, not production.** Wired to **koboi-agent 0.19.1**'s
 > `POST /v1/sessions/{id}/suspend` (atomicity-independent `sqlite3` backup). Deps install and
@@ -87,7 +86,7 @@ Range is its home territory.
 |---|---|---|
 | **Mount** image + use-case config | `mount/` | Dockerfile (Python + koboi `[api]`) |
 | **Outrider** coordinator | `outrider/` | TypeScript / Cloudflare Workers (`@cloudflare/sandbox`) |
-| The koboi **brain** itself | [koboi-agent](../koboi-agent) (consumed as a PyPI image) | Python |
+| The koboi **brain** itself | [koboi-agent](https://github.com/hedypamungkas/koboi-agent) (consumed as a PyPI image) | Python |
 
 ---
 
@@ -209,9 +208,8 @@ npx wrangler deploy
 
 ## Relation to the koboi ecosystem
 
-- **[koboi-agent](../koboi-agent)** — the brain (consumed as `koboi-agent[api]==0.19.1` in the Mount image). The `POST /v1/sessions/{id}/suspend` endpoint + `SQLiteMemory.consistent_backup()` this repo consumes shipped in **0.19.1** (PR #98).
-- **[koboi-use-cases](../koboi-use-cases)** — the sector apps (finance-reconciliation is the demo use case vendored here). Sibling repo, same "consume koboi" pattern.
-- **`koboi-agent/docs/devin-outposts-feasibility.md`** — the feasibility study that motivates this repo and classifies what's READY vs GAP.
+- **[koboi-agent](https://github.com/hedypamungkas/koboi-agent)** — the brain (consumed as `koboi-agent[api]==0.19.1` in the Mount image). The `POST /v1/sessions/{id}/suspend` endpoint + `SQLiteMemory.consistent_backup()` this repo consumes shipped in **0.19.1** (PR #98).
+- **koboi-use-cases** — the sector apps (finance-reconciliation is the demo use case vendored here). Sibling repo, same "consume koboi" pattern.
 
 ---
 
