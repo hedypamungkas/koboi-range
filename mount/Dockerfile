@@ -7,13 +7,15 @@ FROM python:3.12-slim
 
 # Pin to the latest koboi-agent released on PyPI (>=0.18.2). Bump to match the
 # version you actually want to ride on the Range.
-ARG KOBOI_AGENT_VERSION=0.19.0
+ARG KOBOI_AGENT_VERSION=0.19.1
 
 WORKDIR /app
 
 # git: sandbox.git_init seeds each session workdir as a git repo (audit trail) -- needs the binary.
+# procps: the Outrider stops `koboi serve` via `pkill -TERM -f 'koboi serve'` on dismount (slim
+# images don't ship procps by default).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git \
+ && apt-get install -y --no-install-recommends git procps \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir "koboi-agent[api]==${KOBOI_AGENT_VERSION}"
@@ -44,11 +46,12 @@ USER app
 WORKDIR /workspace
 EXPOSE 8000
 
-# Generic single-session server. The Outrider routes exactly ONE session to each
-# Mount, so this is effectively 1 writer / 1 session regardless of pool cap.
-# (Wave-1b TODO: set pool cap=1 to hard-enforce; today it's routing-enforced.)
 ENV KOBOI_CONFIG=/app/config/finance.yaml
 # Point the finance audit log under the Saddlebag root so it rides createBackup
 # (finance_ext/hooks.py defaults to /data/audit -- outside the snapshot root).
 ENV INVOICE_AUDIT_LOG=/workspace/audit/invoice_audit.jsonl
-CMD ["koboi", "serve", "/app/config/finance.yaml"]
+# Keep-alive: the Outrider OWNS the `koboi serve` lifecycle (startProcess after
+# restore+swap; pkill before restore). koboi serve opens the shared SQLite DB EAGERLY
+# in create_app (pre-lifespan) + resume_on_startup at lifespan startup, so the resume-side
+# snapshot swap MUST happen before it starts -- a self-starting CMD would cause split-brain.
+CMD ["sleep", "infinity"]

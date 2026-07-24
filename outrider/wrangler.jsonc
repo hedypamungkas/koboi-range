@@ -15,7 +15,7 @@
   // The Mount image: a `Sandbox` class that is BOTH a containers binding (the image)
   // AND a durable_objects binding (the per-session coordinator the SDK drives).
   "containers": [
-    { "class_name": "Sandbox", "image": "../mount" }
+    { "class_name": "Sandbox", "image": "../mount/Dockerfile" }
   ],
   "durable_objects": {
     "bindings": [

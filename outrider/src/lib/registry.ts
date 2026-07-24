@@ -17,6 +17,8 @@ export interface SessionRecord {
   lastSeen: number; // ms epoch
   idleSince?: number | null; // ms epoch when it first went awaiting_human
   lastError?: string | null;
+  lastCheckpointOk?: boolean | null; // from the /suspend checkpoint on the last dismount
+  koboiSessionId?: string | null; // the koboi session id created inside this Mount (for /suspend + verify)
 }
 
 const PREFIX = "range:session:";

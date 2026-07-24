@@ -26,11 +26,10 @@ scale-to-zero, suspend/resume via FS snapshot) — but the agent **brain is your
 BYO-LLM), not a closed vendor cloud. See the feasibility study that motivates this repo:
 [`koboi-agent/docs/devin-outposts-feasibility.md`](../koboi-agent/docs/devin-outposts-feasibility.md).
 
-> **Wave-0 status — proof scaffold, not production.** Deps install and `tsc --noEmit` pass clean
-> against `@cloudflare/sandbox@0.12.4` (verified 2026-07-23 against the SDK's own `.d.ts`:
-> `getSandbox`, the `Sandbox` Durable-Object class, and the `createBackup`/`restoreBackup`
-> signatures all match the code). Remaining gaps are **operational** (CF account / KV / R2 / secrets)
-> plus the no-WAL-quiesce caveat. See [Honest caveats](#honest-caveats).
+> **Wave-0 status — proof scaffold, not production.** Wired to **koboi-agent 0.19.1**'s
+> `POST /v1/sessions/{id}/suspend` (atomicity-independent `sqlite3` backup). Deps install and
+> `tsc --noEmit` pass clean against `@cloudflare/sandbox@0.12.4`. Remaining gaps are
+> **operational** (CF account / KV / R2 / secrets). See [Honest caveats](#honest-caveats).
 
 ---
 
@@ -43,11 +42,11 @@ Range is its home territory.
 |---|---|
 | **Range** | the platform — your sovereign execution infra |
 | **Outrider** | the edge coordinator (Cloudflare Worker + cron) that dispatches per session |
-| **Mount** | one per-session Cloudflare Container running a single-session koboi server |
+| **Mount** | one per-session Cloudflare Container — a keep-alive; the Outrider starts/stops `koboi serve` inside it |
 | **Saddlebag** | the `/workspace` snapshot (`koboi_memory.db` + steps journal + audit git) → `createBackup`/`restoreBackup` to R2 |
-| **Ride** | start a Mount (restore its Saddlebag if it has one) |
+| **Ride** | boot the Mount, restore+swap its Saddlebag if resuming, then start `koboi serve` + wait ready |
 | **off the Range** | suspended / scale-to-zero (≈ $0) — `dismount` |
-| **Remount** | resume — fresh Mount + `restoreBackup` + koboi `resume_on_startup` / `POST /v1/sessions/:id/resume` |
+| **Remount** | resume — fresh Mount + `restoreBackup` + swap the consistent snapshot in + restart `koboi serve` |
 | **Retire** | terminate — drop Mount + Saddlebag |
 
 ---
@@ -99,28 +98,33 @@ approving a journal entry. The wait is no longer billed:
 
 ```
 t0  controller: "reconcile INV-8842 vs PO-4471"
-      Outrider: POST /lifecycle/ride/<sid>  → Mount boots (restoreBackup if a Saddlebag exists)
-      koboi act-loop: fetch_invoice → fetch_po → three_way_match   [SAFE reads, no gate]
+      Outrider: POST /lifecycle/ride/<sid>
+        → Mount boots (keep-alive); restoreBackup(<saddlebag>) if resuming, else fresh
+        → swapSnapshot (resume only): mv koboi_memory.db.<sid>.suspend.db → koboi_memory.db
+        → startProcess("koboi serve") + wait /healthz 200   (the DB opens eagerly at boot)
 
-t1  koboi calls post_journal_entry  (DESTRUCTIVE)
-      → emits pending_approval → /lifecycle/observe marks session awaiting_human → IDLE
+t1  koboi act-loop: fetch_invoice → fetch_po → three_way_match   [SAFE reads, no gate]
+      koboi calls post_journal_entry (DESTRUCTIVE) → pending_approval → awaiting_human → IDLE
 
-t2  cron (1/min): sid awaiting_human + idle > 60s
-      → createBackup({dir:"/workspace"}) → R2 Saddlebag
-      → Mount scales to zero                               💤 ~$0 while the controller reviews
+t2  cron (1/min): awaiting_human + idle > 60s  →  DISMOUNT:
+        → POST /v1/sessions/<sid>/suspend   → koboi writes a consistent snapshot
+          (sqlite3 Online Backup API — atomicity-independent of createBackup)
+        → createBackup({dir:"/workspace"})  → R2 Saddlebag  (snapshot file + workdir + audit)
+        → pkill koboi serve  → Mount scales to zero          💤 ~$0 while the controller reviews
 
-t3  controller clicks Approve  (hours later)
-      → status -> resuming → cron REMOUNTS: fresh Mount + restoreBackup(/workspace)
-      → koboi resume_on_startup rehydrates the interrupted turn from the steps journal
-      → post_journal_entry completes → ledger row written → audit row appended
+t3  controller clicks Approve  (hours later)  →  status → resuming  →  cron REMOUNTS:
+        → fresh Mount + restoreBackup  →  swapSnapshot  →  startProcess("koboi serve") + wait ready
+        → koboi resume_on_startup rehydrates the interrupted turn; post_journal_entry completes
 
-t4  run terminal → cron sees done → RETIRE: drop Mount + delete Saddlebag
+t4  run terminal → cron sees done → RETIRE: stop serve + drop Saddlebag
 ```
 
-> koboi's `steps` journal writes the `running` marker **before** each LLM/tool step
-> (`koboi-agent/koboi/journal.py:81-87`), so the t2→t3 gap is *survivable*. The generic
-> Devin template warns "abrupt failure can lose recent changes"; koboi-range does not, because
-> the journal is the durability source and the Saddlebag is just the FS that holds it.
+> **Why the keep-alive Mount?** `koboi serve` opens the shared SQLite DB **eagerly** in `create_app`
+> (JobStore/OwnershipStore, pre-lifespan) and `resume_on_startup` reads it at lifespan startup —
+> *before* the first request. So the resume-side snapshot swap **must** happen before `koboi serve`
+> starts (else split-brain: sidecars hold the old file while `resume_on_startup` ran on stale rows).
+> The Outrider therefore owns the `koboi serve` lifecycle (start after restore+swap; stop before
+> restore). koboi's `steps` journal makes the t2→t3 gap survivable regardless.
 
 ---
 
@@ -183,15 +187,16 @@ npx wrangler deploy
   `BackupOptions.dir` **must** be under `/workspace`·`/home`·`/tmp`·`/var/tmp`·`/app` (not `/data`)
   — hence the Saddlebag root is `/workspace`. Per-instance container teardown (`sb.stop()`/destroy)
   is still a Wave-1b TODO (today: TTL auto-GC + idle scale-to-zero).
-- **No WAL quiesce yet.** `dismount` snapshots `/workspace` without `PRAGMA wal_checkpoint(TRUNCATE)`.
-  Safe **only because the Outrider dismounts at session-idle** (no SQLite writer in flight). The
-  clean fix is a ~10-LOC `SQLiteMemory.quiesce()` helper + `POST /v1/sessions/:id/suspend` /
-  `/resume` endpoints — a small follow-up PR to **koboi-agent core**, not this repo.
-- **Chat reverse-proxy uses standard DO RPC** (`env.Sandbox.idFromName(sid)` → `stub.fetch(req)`),
-  routing `X-Session-Id` to that session's Mount; the Container DO forwards into the Mount's
-  `koboi serve`. Confirm the container forwards arbitrary HTTP paths at first deploy (the SDK also
-  ships `proxyToSandbox`/`proxyTerminal` if a URL-convention routing fits you better). The lifecycle
-  control API + the Wave-0 proof work regardless.
+- **Consistency is via koboi 0.19.1 `/suspend`, not WAL quiesce.** On dismount the Outrider calls
+  `POST /v1/sessions/{id}/suspend`, which writes a **consistent** snapshot via the sqlite3 Online
+  Backup API (atomicity-independent — safe even while other connections write). The Outrider then
+  `createBackup`s `/workspace` (capturing that file + workdir + audit). On resume it restores +
+  swaps the snapshot into place **before** starting `koboi serve`. No raw WAL-trio file-copy.
+- **Control plane is all SDK RPC (no Worker→container HTTP).** Readiness uses
+  `proc.waitForPort(8000, {path:"/healthz"})`; `/suspend` + session create/verify run a one-shot
+  HTTP call **from inside the Mount** (localhost:8000) via `sb.exec`. This is why it works on
+  `.workers.dev` (no `exposePort`/tunnel/custom-domain). Client chat **streaming** (the data
+  plane) needs a public Mount URL — Wave-1 (`POST /chat/stream` returns 501 for now).
 - **`pending_approval` observation is via a webhook receiver** (`/lifecycle/observe/:sid`).
   Wire the Mount's `jobs.webhooks` / `handover.webhooks` to POST there. (Polling the Mount's job
   status from the cron is the alternative.)
@@ -204,7 +209,7 @@ npx wrangler deploy
 
 ## Relation to the koboi ecosystem
 
-- **[koboi-agent](../koboi-agent)** — the brain (consumed as `koboi-agent[api]` in the Mount image). Zero engine change required for Wave-0; the only core touches (quiesce + suspend/resume endpoints) are a small follow-up PR.
+- **[koboi-agent](../koboi-agent)** — the brain (consumed as `koboi-agent[api]==0.19.1` in the Mount image). The `POST /v1/sessions/{id}/suspend` endpoint + `SQLiteMemory.consistent_backup()` this repo consumes shipped in **0.19.1** (PR #98).
 - **[koboi-use-cases](../koboi-use-cases)** — the sector apps (finance-reconciliation is the demo use case vendored here). Sibling repo, same "consume koboi" pattern.
 - **`koboi-agent/docs/devin-outposts-feasibility.md`** — the feasibility study that motivates this repo and classifies what's READY vs GAP.
 

@@ -1,70 +1,57 @@
 // koboi-range Outrider -- the edge coordinator.
 //
-// Responsibilities:
-//   1. Route per-session chat traffic to the right Mount (one CF Container per session).
-//   2. Observe koboi session status (via the /lifecycle/observe webhook receiver).
-//   3. Run a 1/min cron (the "Range heartbeat") that:
-//        - awaiting_human + idle  -> DISMOUNT  (snapshot /workspace -> R2 Saddlebag, ~$0)
-//        - resuming / approved    -> REMOUNT   (fresh Mount + restore Saddlebag + koboi resume)
-//        - done                   -> RETIRE    (drop Mount + Saddlebag)
-//
-// Verified against @cloudflare/sandbox@0.12.4 (2026-07-23). The lifecycle control
-// + cron are the solid Wave-0 core that proves suspend/resume; chat routing uses
-// standard Durable-Object RPC (idFromName -> stub.fetch).
+// Lifecycle (all SDK RPC -- no Worker->container HTTP, so it works on .workers.dev):
+//   ride     boot Mount (keep-alive) + restore/swap Saddlebag + start `koboi serve` + waitForPort
+//   session  create a koboi session inside the Mount (POST /v1/sessions via in-Mount exec)
+//   dismount /suspend (consistent snapshot) -> createBackup(/workspace) -> stop serve (~$0)
+//   remount  stop -> restore Saddlebag -> swap snapshot -> start serve -> waitForPort
+//   messages GET the session's messages (proves the restored/swapped DB is live)
+//   retire   stop serve + drop Saddlebag
+// The cron (1/min) drives awaiting_human->dismount, resuming->remount, done->retire.
+// Client chat STREAMING (data plane) needs a public Mount URL (tunnel/exposePort) -> Wave-1.
 
 import type { Env } from "./lib/sandbox";
-// Re-export the SDK's Sandbox DO class so the durable_objects `class_name: "Sandbox"` resolves.
 export { Sandbox } from "@cloudflare/sandbox";
 
-import { ride, dismount, remount, retire } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
-const IDLE_THRESHOLD_MS = 60_000; // dismount after 60s in awaiting_human
+const IDLE_THRESHOLD_MS = 60_000;
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
-    if (url.pathname === "/healthz")
-      return json({ service: "koboi-range-outrider", status: "ok" });
+    if (url.pathname === "/healthz") return json({ service: "koboi-range-outrider", status: "ok" });
 
-    // Lifecycle control surface (see handleLifecycle).
     const m = url.pathname.match(
-      /^\/lifecycle\/(ride|dismount|remount|retire|status|observe)\/([^/]+)$/,
+      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages)\/([^/]+)$/,
     );
     if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env);
 
-    // Chat reverse-proxy: route X-Session-Id -> that session's Mount DO via standard
-    // DO RPC; the Container DO forwards the request into the Mount's koboi serve.
+    // Chat STREAMING (data plane): needs a public Mount URL (tunnel/exposePort) -- Wave-1.
     const sid = req.headers.get("X-Session-Id");
     if (sid && (url.pathname === "/chat/stream" || url.pathname.startsWith("/v1/"))) {
-      const id = env.Sandbox.idFromName(sid);
-      return env.Sandbox.get(id).fetch(req);
+      return json({ error: "data_plane_not_wired", detail: "client chat streaming needs a public Mount URL (tunnel/exposePort) -- Wave-1" }, 501);
     }
 
     return json({ error: "not found", path: url.pathname }, 404);
   },
 
-  // The Range heartbeat -- runs every 1 min via wrangler `triggers.crons`.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       (async () => {
-        const sessions = await reg.list(env);
-        const now = Date.now();
-        for (const s of sessions) {
+        for (const s of await reg.list(env)) {
           try {
-            if (
-              s.status === "awaiting_human" &&
-              s.idleSince &&
-              now - s.idleSince > IDLE_THRESHOLD_MS
-            ) {
-              const backup = await dismount(env, s.sessionId);
-              await reg.setStatus(env, s.sessionId, "suspended", { saddlebag: backup });
-            } else if (s.status === "resuming") {
-              if (s.saddlebag) {
-                await remount(env, s.sessionId, s.saddlebag);
-                await reg.setStatus(env, s.sessionId, "riding");
-              }
+            if (s.status === "awaiting_human" && s.idleSince && Date.now() - s.idleSince > IDLE_THRESHOLD_MS) {
+              const res = await dismount(env, s.sessionId, s.koboiSessionId ?? s.sessionId);
+              await reg.setStatus(env, s.sessionId, "suspended", {
+                saddlebag: res.backup,
+                lastCheckpointOk: res.checkpoint.ok,
+              });
+            } else if (s.status === "resuming" && s.saddlebag) {
+              await remount(env, s.sessionId, s.saddlebag);
+              await reg.setStatus(env, s.sessionId, "riding");
             } else if (s.status === "done") {
               await retire(env, s.sessionId, s.saddlebag ?? null);
               await env.RANGE_KV.delete("range:session:" + s.sessionId);
@@ -79,12 +66,7 @@ export default {
   },
 };
 
-async function handleLifecycle(
-  action: string,
-  sid: string,
-  req: Request,
-  env: Env,
-): Promise<Response> {
+async function handleLifecycle(action: string, sid: string, req: Request, env: Env): Promise<Response> {
   switch (action) {
     case "ride": {
       const existing = await reg.get(env, sid);
@@ -92,14 +74,26 @@ async function handleLifecycle(
       await reg.setStatus(env, sid, "riding", { saddlebag: existing?.saddlebag ?? null });
       return json({ sid, action: "ride", status: "riding" });
     }
+    case "session": {
+      await ride(env, sid, (await reg.get(env, sid))?.saddlebag ?? null); // ensure Mount is up
+      const koboiSid = await createSession(env, sid);
+      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid });
+      return json({ sid, action: "session", koboiSessionId: koboiSid, status: "riding" });
+    }
     case "dismount": {
-      const backup = await dismount(env, sid);
-      await reg.setStatus(env, sid, "suspended", { saddlebag: backup });
+      const rec = await reg.get(env, sid);
+      const res = await dismount(env, sid, rec?.koboiSessionId ?? sid);
+      await reg.setStatus(env, sid, "suspended", {
+        saddlebag: res.backup,
+        lastCheckpointOk: res.checkpoint.ok,
+      });
       return json({
         sid,
         action: "dismount",
         status: "suspended",
-        saddlebagId: backup.id,
+        saddlebagId: res.backup.id,
+        checkpoint: res.checkpoint,
+        snapshotPath: res.snapshotPath,
       });
     }
     case "remount": {
@@ -108,6 +102,11 @@ async function handleLifecycle(
       await remount(env, sid, rec.saddlebag);
       await reg.setStatus(env, sid, "riding");
       return json({ sid, action: "remount", status: "riding" });
+    }
+    case "messages": {
+      const rec = await reg.get(env, sid);
+      if (rec?.status !== "riding") return json({ error: "session_not_riding", status: rec?.status ?? "unknown" }, 503);
+      return json(await sessionMessages(env, sid, rec.koboiSessionId ?? sid));
     }
     case "retire": {
       const rec = await reg.get(env, sid);
@@ -119,14 +118,11 @@ async function handleLifecycle(
       return json(await reg.get(env, sid));
     }
     case "observe": {
-      // koboi `jobs.webhooks` / `handover.webhooks` POST here on status changes.
-      // Wire the Mount config to point webhooks at: https://<outrider>/lifecycle/observe/<sid>
       const body = (await req.json().catch(() => ({}))) as { status?: string };
       const st = String(body.status ?? "").toLowerCase();
       if (st.includes("await") || st.includes("pending") || st === "awaiting_human")
         await reg.setStatus(env, sid, "awaiting_human");
-      else if (["completed", "done", "succeeded"].includes(st))
-        await reg.setStatus(env, sid, "done");
+      else if (["completed", "done", "succeeded"].includes(st)) await reg.setStatus(env, sid, "done");
       return json({ sid, observed: st });
     }
   }
