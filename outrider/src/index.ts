@@ -67,6 +67,7 @@ export default {
 };
 
 async function handleLifecycle(action: string, sid: string, req: Request, env: Env): Promise<Response> {
+  try {
   switch (action) {
     case "ping": {
       return json({ sid, action: "ping", pong: await pingMount(env, sid) });
@@ -133,6 +134,9 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     }
   }
   return json({ error: "unknown action" }, 400);
+  } catch (e) {
+    return json({ error: "lifecycle_failed", action, sid, detail: String((e as Error)?.message ?? e) }, 500);
+  }
 }
 
 function json(body: unknown, status = 200): Response {

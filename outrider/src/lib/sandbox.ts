@@ -119,6 +119,7 @@ export async function dismount(env: Env, sessionId: string, koboiSid: string): P
     dir: SADDLEBAG_DIR,
     name: sessionId,
     ttl: SADDLEBAG_TTL_SEC,
+    localBucket: true, // use the BACKUP_BUCKET R2 binding directly (no presigned R2 creds needed)
   } satisfies BackupOptions);
   await stopServe(sb);
   return { backup, checkpoint: body.checkpoint, snapshotPath: body.snapshot_path };
