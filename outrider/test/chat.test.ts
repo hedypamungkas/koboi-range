@@ -248,4 +248,29 @@ describe("chat routes", () => {
     expect(st.status).toBe("riding");
     expect(st.lastError).toBeFalsy();
   });
+
+  it("GET poll with an unrecognized koboi status -> records lastError (no silent passthrough on drift)", async () => {
+    await seed("s10", { koboiSessionId: "k-s10" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "j10", status: "rate_limited", session_id: "k-s10" }));
+    const r = await call("http://outrider/lifecycle/chat/s10/j10");
+    expect(r.status).toBe(200);
+    const st = (await json(await call("http://outrider/lifecycle/status/s10"))) as Record<string, unknown>;
+    expect(st.status).toBe("riding");
+    expect(String(st.lastError)).toMatch(/unexpected/);
+    expect(String(st.lastError)).toMatch(/rate_limited/);
+  });
+
+  it("POST submit clears a prior lastError (recovery on retry)", async () => {
+    await seed("s11", { koboiSessionId: "k-s11", lastError: "prior boom" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "j11", status: "pending", session_id: "k-s11" }, 202));
+    const r = await call("http://outrider/lifecycle/chat/s11", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "retry" }),
+    });
+    expect(r.status).toBe(202);
+    const st = (await json(await call("http://outrider/lifecycle/status/s11"))) as Record<string, unknown>;
+    expect(st.status).toBe("riding");
+    expect(st.lastError).toBeNull();
+  });
 });

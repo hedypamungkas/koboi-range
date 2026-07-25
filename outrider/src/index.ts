@@ -17,10 +17,12 @@
 import type { Env } from "./lib/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
 
-import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, KOBOI_JOB_STATUSES } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
 const IDLE_THRESHOLD_MS = 60_000;
+/** Runtime mirror of KoboiJobStatus for validating poll bodies (the TS cast is not a runtime check). */
+const KOBOI_JOB_STATUS_SET: ReadonlySet<string> = new Set(KOBOI_JOB_STATUSES);
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -115,6 +117,11 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
           await reg.setStatus(env, sid, "riding", {
             lastError: `chat ${jobId} ${st}${out.body.error_class ? ` (${out.body.error_class})` : ""}: ${out.body.error ?? "<no detail>"}`,
           });
+        } else if (!KOBOI_JOB_STATUS_SET.has(st)) {
+          // KoboiJobStatus is compile-time only; the wire body is unvalidated -- flag drift/missing.
+          await reg.setStatus(env, sid, "riding", {
+            lastError: `chat ${jobId}: unexpected koboi status ${JSON.stringify(st)}`,
+          });
         }
         return json({ sid, action: "chat", job: out.body });
       }
@@ -139,7 +146,7 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
       let koboiSid = existing?.koboiSessionId ?? null;
       if (existing?.status !== "riding") await ride(env, sid, existing?.saddlebag ?? null);
       if (!koboiSid) koboiSid = await createSession(env, sid);
-      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid });
+      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, lastError: null });
       const job = await submitChatJob(env, sid, koboiSid, {
         message: body.message,
         mode: body.mode,

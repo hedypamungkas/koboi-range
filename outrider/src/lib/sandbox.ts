@@ -77,7 +77,9 @@ async function httpInMount(
     "except Exception as e: print(json.dumps({'status':0,'body':'ERR: '+str(e)}))",
   ].join("\n");
   const b64 = b64encodeUtf8(py);
-  const res = await sb.exec(`python3 -c "import base64;exec(base64.b64decode('${b64}'))"`, { timeout: timeoutMs });
+  // Pad the exec budget so the in-container urllib timeout (the real cause) surfaces in the result
+  // before the SDK kills the exec -- otherwise a slow koboi races the kill and the ERR is lost.
+  const res = await sb.exec(`python3 -c "import base64;exec(base64.b64decode('${b64}'))"`, { timeout: timeoutMs + 2000 });
   // A non-zero exit (python3 missing / OOM / SDK RPC failure) leaves no JSON line -- surface stderr.
   if (res.exitCode !== 0) {
     return { status: 0, body: `exec exit ${res.exitCode}: stderr=${(res.stderr || "").trim().slice(0, 400)}` };
@@ -143,16 +145,20 @@ export interface KoboiJobSubmit {
   max_iterations?: number;
 }
 
-/** koboi job lifecycle states (koboi 0.19.1 GET /v1/jobs/{id}). */
-export type KoboiJobStatus =
-  | "reserved"
-  | "pending"
-  | "running"
-  | "completed"
-  | "cancelled"
-  | "timed_out"
-  | "awaiting_human"
-  | "failed";
+/** koboi job lifecycle states (koboi 0.19.1 GET /v1/jobs/{id}). The const array is the single source
+ *  of truth: the type is derived from it, and callers build a runtime Set to validate wire bodies
+ *  (the `as JobStatusResponse` cast is compile-time only). */
+export const KOBOI_JOB_STATUSES = [
+  "reserved",
+  "pending",
+  "running",
+  "completed",
+  "cancelled",
+  "timed_out",
+  "awaiting_human",
+  "failed",
+] as const;
+export type KoboiJobStatus = (typeof KOBOI_JOB_STATUSES)[number];
 
 export interface KoboiJobHandle {
   job_id: string;
