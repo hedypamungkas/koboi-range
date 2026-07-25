@@ -27,10 +27,10 @@ describe("routing", () => {
     expect((await call("http://outrider/nope")).status).toBe(404);
   });
 
-  it("chat data plane is not wired (Wave-1) -> 501", async () => {
+  it("chat STREAMING not wired (Wave-1) -> 501 (non-streaming chat IS wired via /lifecycle/chat)", async () => {
     const r = await call("http://outrider/chat/stream", { headers: { "X-Session-Id": "s1" } });
     expect(r.status).toBe(501);
-    expect(await json(r)).toMatchObject({ error: "data_plane_not_wired" });
+    expect(await json(r)).toMatchObject({ error: "streaming_not_wired" });
   });
 
   it("observe awaiting -> registry awaiting_human", async () => {

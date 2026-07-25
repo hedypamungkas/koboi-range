@@ -8,15 +8,21 @@
 //   messages GET the session's messages (proves the restored/swapped DB is live)
 //   retire   stop serve + drop Saddlebag
 // The cron (1/min) drives awaiting_human->dismount, resuming->remount, done->retire.
-// Client chat STREAMING (data plane) needs a public Mount URL (tunnel/exposePort) -> Wave-1.
+// Client chat (data plane) -- async submit+poll over the same RPC (no public URL needed):
+//   chat  POST /lifecycle/chat/<sid>            -> 202 {job_id} (koboi /v1/jobs, continues the session)
+//         GET  /lifecycle/chat/<sid>/<job_id>   -> JobStatusResponse (poll until terminal)
+//   awaiting_human on poll flips the registry so the cron dismounts (~$0 while the controller reviews).
+// Live-token STREAMING (POST /chat/stream) still needs a public Mount URL -> Wave-1 streaming.
 
 import type { Env } from "./lib/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
 
-import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, KOBOI_JOB_STATUSES } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
 const IDLE_THRESHOLD_MS = 60_000;
+/** Runtime mirror of KoboiJobStatus for validating poll bodies (the TS cast is not a runtime check). */
+const KOBOI_JOB_STATUS_SET: ReadonlySet<string> = new Set(KOBOI_JOB_STATUSES);
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -25,14 +31,15 @@ export default {
     if (url.pathname === "/healthz") return json({ service: "koboi-range-outrider", status: "ok" });
 
     const m = url.pathname.match(
-      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages|ping|reconcile)\/([^/]+)$/,
+      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages|ping|reconcile|chat)\/([^/]+)(?:\/([^/]+))?$/,
     );
-    if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env);
+    if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env, m[3] ? decodeURIComponent(m[3]) : undefined);
 
-    // Chat STREAMING (data plane): needs a public Mount URL (tunnel/exposePort) -- Wave-1.
+    // Chat STREAMING (data plane, live tokens): needs a public Mount URL (tunnel/exposePort) -- Wave-1 streaming.
+    // Non-streaming chat (submit + poll) IS wired: POST /lifecycle/chat/<sid>, GET /lifecycle/chat/<sid>/<job_id>.
     const sid = req.headers.get("X-Session-Id");
     if (sid && (url.pathname === "/chat/stream" || url.pathname.startsWith("/v1/"))) {
-      return json({ error: "data_plane_not_wired", detail: "client chat streaming needs a public Mount URL (tunnel/exposePort) -- Wave-1" }, 501);
+      return json({ error: "streaming_not_wired", detail: "live-token streaming needs a public Mount URL (tunnel/exposePort) -- Wave-1 streaming. Use POST /lifecycle/chat/<sid> (submit) + GET /lifecycle/chat/<sid>/<job_id> (poll) for non-streaming chat." }, 501);
     }
 
     return json({ error: "not found", path: url.pathname }, 404);
@@ -66,7 +73,7 @@ export default {
   },
 };
 
-async function handleLifecycle(action: string, sid: string, req: Request, env: Env): Promise<Response> {
+async function handleLifecycle(action: string, sid: string, req: Request, env: Env, jobId?: string): Promise<Response> {
   try {
   switch (action) {
     case "ping": {
@@ -86,6 +93,66 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
       const koboiSid = await createSession(env, sid);
       await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid });
       return json({ sid, action: "session", koboiSessionId: koboiSid, status: "riding" });
+    }
+    case "chat": {
+      // POLL: GET /lifecycle/chat/<sid>/<job_id>
+      if (req.method === "GET") {
+        if (!jobId) return json({ error: "missing job_id", detail: "GET /lifecycle/chat/<sid>/<job_id>" }, 400);
+        // koboi serve only answers while riding -- mirror the `messages` guard so polling a dismounted
+        // session returns a clean 503 instead of a connection-refused -> generic 500.
+        const rec = await reg.get(env, sid);
+        if (rec?.status !== "riding") {
+          return json({ error: "session_not_riding", status: rec?.status ?? "unknown" }, 503);
+        }
+        const out = await pollChatJob(env, sid, jobId);
+        const st = out.body.status; // KoboiJobStatus -- compiler-checked, no cast off `unknown`
+        // Drive the registry from the job's terminal state so the cron + operator see it:
+        //  - awaiting_human -> dismount (~$0 while the controller reviews) [unchanged design]
+        //  - failed/timed_out -> record lastError (was invisible); KEEP riding so the client can retry.
+        //    We deliberately do NOT flip `completed` to `done` -- that would retire the warm Mount and
+        //    break cross-chat continuity; retirement stays controller-driven via `observe`.
+        if (st === "awaiting_human") {
+          await reg.setStatus(env, sid, "awaiting_human");
+        } else if (st === "failed" || st === "timed_out") {
+          await reg.setStatus(env, sid, "riding", {
+            lastError: `chat ${jobId} ${st}${out.body.error_class ? ` (${out.body.error_class})` : ""}: ${out.body.error ?? "<no detail>"}`,
+          });
+        } else if (!KOBOI_JOB_STATUS_SET.has(st)) {
+          // KoboiJobStatus is compile-time only; the wire body is unvalidated -- flag drift/missing.
+          await reg.setStatus(env, sid, "riding", {
+            lastError: `chat ${jobId}: unexpected koboi status ${JSON.stringify(st)}`,
+          });
+        }
+        return json({ sid, action: "chat", job: out.body });
+      }
+      if (req.method !== "POST") {
+        return json({ error: "method_not_allowed", detail: "chat supports GET (poll) and POST (submit)" }, 405);
+      }
+      // SUBMIT: POST /lifecycle/chat/<sid>  body {message, mode?, max_iterations?}
+      let body: { message?: string; mode?: string; max_iterations?: number };
+      try {
+        body = await req.json();
+      } catch (parseErr) {
+        // Distinguish a malformed body from an empty one (was silently coerced to {} -> "missing message").
+        console.error("chat submit: invalid JSON", sid, String(parseErr));
+        return json({ error: "invalid_json", detail: "request body was not valid JSON" }, 400);
+      }
+      if (!body.message || !body.message.trim()) {
+        return json({ error: "missing message", detail: "POST /lifecycle/chat/<sid> body {message}" }, 400);
+      }
+      // Ensure the Mount is riding + we have a koboi session to continue (lazily creates one),
+      // skipping ride if already riding (avoids a redundant `koboi serve` spawn on repeat chats).
+      const existing = await reg.get(env, sid);
+      let koboiSid = existing?.koboiSessionId ?? null;
+      if (existing?.status !== "riding") await ride(env, sid, existing?.saddlebag ?? null);
+      if (!koboiSid) koboiSid = await createSession(env, sid);
+      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, lastError: null });
+      const job = await submitChatJob(env, sid, koboiSid, {
+        message: body.message,
+        mode: body.mode,
+        max_iterations: body.max_iterations,
+      });
+      return json({ sid, action: "chat", job_id: job.job_id, status: job.status, koboi_session_id: koboiSid }, 202);
     }
     case "dismount": {
       const rec = await reg.get(env, sid);
