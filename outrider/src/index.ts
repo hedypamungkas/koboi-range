@@ -96,14 +96,40 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
       // POLL: GET /lifecycle/chat/<sid>/<job_id>
       if (req.method === "GET") {
         if (!jobId) return json({ error: "missing job_id", detail: "GET /lifecycle/chat/<sid>/<job_id>" }, 400);
+        // koboi serve only answers while riding -- mirror the `messages` guard so polling a dismounted
+        // session returns a clean 503 instead of a connection-refused -> generic 500.
+        const rec = await reg.get(env, sid);
+        if (rec?.status !== "riding") {
+          return json({ error: "session_not_riding", status: rec?.status ?? "unknown" }, 503);
+        }
         const out = await pollChatJob(env, sid, jobId);
-        const st = (out.body as { status?: string }).status;
-        // A chat that hit a destructive-tool approval -> surface it to the cron so it dismounts (~$0).
-        if (st === "awaiting_human") await reg.setStatus(env, sid, "awaiting_human");
+        const st = out.body.status; // KoboiJobStatus -- compiler-checked, no cast off `unknown`
+        // Drive the registry from the job's terminal state so the cron + operator see it:
+        //  - awaiting_human -> dismount (~$0 while the controller reviews) [unchanged design]
+        //  - failed/timed_out -> record lastError (was invisible); KEEP riding so the client can retry.
+        //    We deliberately do NOT flip `completed` to `done` -- that would retire the warm Mount and
+        //    break cross-chat continuity; retirement stays controller-driven via `observe`.
+        if (st === "awaiting_human") {
+          await reg.setStatus(env, sid, "awaiting_human");
+        } else if (st === "failed" || st === "timed_out") {
+          await reg.setStatus(env, sid, "riding", {
+            lastError: `chat ${jobId} ${st}${out.body.error_class ? ` (${out.body.error_class})` : ""}: ${out.body.error ?? "<no detail>"}`,
+          });
+        }
         return json({ sid, action: "chat", job: out.body });
       }
+      if (req.method !== "POST") {
+        return json({ error: "method_not_allowed", detail: "chat supports GET (poll) and POST (submit)" }, 405);
+      }
       // SUBMIT: POST /lifecycle/chat/<sid>  body {message, mode?, max_iterations?}
-      const body = (await req.json().catch(() => ({}))) as { message?: string; mode?: string; max_iterations?: number };
+      let body: { message?: string; mode?: string; max_iterations?: number };
+      try {
+        body = await req.json();
+      } catch (parseErr) {
+        // Distinguish a malformed body from an empty one (was silently coerced to {} -> "missing message").
+        console.error("chat submit: invalid JSON", sid, String(parseErr));
+        return json({ error: "invalid_json", detail: "request body was not valid JSON" }, 400);
+      }
       if (!body.message || !body.message.trim()) {
         return json({ error: "missing message", detail: "POST /lifecycle/chat/<sid> body {message}" }, 400);
       }

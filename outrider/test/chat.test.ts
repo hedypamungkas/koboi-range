@@ -29,6 +29,22 @@ const seed = (sid: string, patch: Record<string, unknown> = {}) =>
     JSON.stringify({ sessionId: sid, status: "riding", koboiSessionId: "k-" + sid, lastSeen: 0, ...patch }),
   );
 
+/** UTF-8-safe base64 decode (mirrors sandbox.ts b64encodeUtf8) for asserting what koboi received. */
+const b64DecodeUtf8 = (b64: string) => {
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+};
+
+/** Decode the JSON body koboi received from the i-th exec call (the POST /v1/jobs payload).
+ *  The SDK mock's `calls` are typed as empty-param tuples, so index through `unknown[]`. */
+const submittedBody = (callIdx = 0): Record<string, unknown> => {
+  const cmd = (sandboxSpy.exec.mock.calls[callIdx] as unknown[])[0] as string;
+  const py = b64DecodeUtf8(cmd.match(/b64decode\('([^']+)'\)/)![1]);
+  const bodyB64 = py.match(/data=base64\.b64decode\("([^"]+)"\)/)![1];
+  return JSON.parse(b64DecodeUtf8(bodyB64));
+};
+
 beforeEach(async () => {
   sandboxSpy.exec.mockClear();
   sandboxSpy.startProcess.mockClear();
@@ -53,6 +69,18 @@ describe("submitChatJob", () => {
       /\/v1\/jobs returned 400/,
     );
   });
+
+  it("encodes message + resumed session_id (+mode/max_iterations); non-ASCII survives (C1/C2)", async () => {
+    // Before the UTF-8 btoa fix, 三菱/🎉 would throw InvalidCharacterError before exec ever ran.
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "job_x", status: "pending", session_id: "k-三菱" }, 202));
+    await submitChatJob(envLite, "s1", "k-三菱", { message: "reconcile 三菱 INV-8842 🎉", mode: "act", max_iterations: 7 });
+    expect(submittedBody(0)).toMatchObject({
+      message: "reconcile 三菱 INV-8842 🎉",
+      session_id: "k-三菱",
+      mode: "act",
+      max_iterations: 7,
+    });
+  });
 });
 
 describe("pollChatJob", () => {
@@ -62,7 +90,7 @@ describe("pollChatJob", () => {
     );
     const out = await pollChatJob(envLite, "s1", "job_123");
     expect(out.status).toBe(200);
-    expect((out.body as { status: string }).status).toBe("completed");
+    expect(out.body.status).toBe("completed");
   });
 
   it("non-200 -> throws", async () => {
@@ -133,5 +161,91 @@ describe("chat routes", () => {
     expect(body.job.result.content).toBe("Matched");
     const st = (await json(await call("http://outrider/lifecycle/status/s3"))) as Record<string, unknown>;
     expect(st.status).toBe("riding");
+  });
+
+  it("POST on an already-riding session skips ride + createSession and continues the existing koboi session (C2-gap)", async () => {
+    await seed("s4", { koboiSessionId: "k-s4" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "job_cont", status: "pending", session_id: "k-s4" }, 202));
+    const r = await call("http://outrider/lifecycle/chat/s4", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "second chat" }),
+    });
+    expect(r.status).toBe(202);
+    expect(await json(r)).toMatchObject({ job_id: "job_cont", koboi_session_id: "k-s4" });
+    // No ride -> no startProcess; no createSession -> exactly one exec (the submit), continuing k-s4.
+    expect(sandboxSpy.startProcess).not.toHaveBeenCalled();
+    expect(sandboxSpy.exec).toHaveBeenCalledTimes(1);
+    expect(submittedBody(0)).toMatchObject({ session_id: "k-s4", message: "second chat" });
+  });
+
+  it("POST submit failure -> 500 lifecycle_failed (outer catch surfaces it, not a silent 200) (C3-gap)", async () => {
+    await seed("s5", { koboiSessionId: "k-s5" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ detail: "koboi blew up" }, 500));
+    const r = await call("http://outrider/lifecycle/chat/s5", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "hi" }),
+    });
+    expect(r.status).toBe(500);
+    expect(await json(r)).toMatchObject({ error: "lifecycle_failed", action: "chat" });
+  });
+
+  it("POST with malformed JSON -> 400 invalid_json (was silently coerced to 'missing message')", async () => {
+    const r = await call("http://outrider/lifecycle/chat/s1", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+    expect(r.status).toBe(400);
+    expect(await json(r)).toMatchObject({ error: "invalid_json" });
+    expect(sandboxSpy.exec).not.toHaveBeenCalled();
+  });
+
+  it("DELETE /lifecycle/chat/<sid> -> 405 (only GET/POST supported)", async () => {
+    const r = await call("http://outrider/lifecycle/chat/s1", { method: "DELETE" });
+    expect(r.status).toBe(405);
+    expect(sandboxSpy.exec).not.toHaveBeenCalled();
+  });
+
+  it("GET poll on a non-riding session -> 503 session_not_riding (koboi serve isn't up)", async () => {
+    await seed("s6", { status: "suspended" });
+    const r = await call("http://outrider/lifecycle/chat/s6/j1");
+    expect(r.status).toBe(503);
+    expect(await json(r)).toMatchObject({ error: "session_not_riding", status: "suspended" });
+    expect(sandboxSpy.exec).not.toHaveBeenCalled();
+  });
+
+  it("GET poll failed -> records lastError, registry stays riding (visible + retryable)", async () => {
+    await seed("s7", { koboiSessionId: "k-s7" });
+    sandboxSpy.exec.mockResolvedValueOnce(
+      execOut({ job_id: "j7", status: "failed", session_id: "k-s7", error: "tool broke", error_class: "ValueError" }),
+    );
+    const r = await call("http://outrider/lifecycle/chat/s7/j7");
+    expect(r.status).toBe(200);
+    const st = (await json(await call("http://outrider/lifecycle/status/s7"))) as Record<string, unknown>;
+    expect(st.status).toBe("riding");
+    expect(String(st.lastError)).toMatch(/failed/);
+    expect(String(st.lastError)).toMatch(/ValueError/);
+    expect(String(st.lastError)).toMatch(/tool broke/);
+  });
+
+  it("GET poll timed_out -> records lastError too", async () => {
+    await seed("s8", { koboiSessionId: "k-s8" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "j8", status: "timed_out", session_id: "k-s8", error: "slow" }));
+    await call("http://outrider/lifecycle/chat/s8/j8");
+    const st = (await json(await call("http://outrider/lifecycle/status/s8"))) as Record<string, unknown>;
+    expect(st.status).toBe("riding");
+    expect(String(st.lastError)).toMatch(/timed_out/);
+  });
+
+  it("GET poll cancelled -> passes through, registry stays riding (no failure recorded)", async () => {
+    await seed("s9", { koboiSessionId: "k-s9" });
+    sandboxSpy.exec.mockResolvedValueOnce(execOut({ job_id: "j9", status: "cancelled", session_id: "k-s9" }));
+    const r = await call("http://outrider/lifecycle/chat/s9/j9");
+    expect(r.status).toBe(200);
+    const st = (await json(await call("http://outrider/lifecycle/status/s9"))) as Record<string, unknown>;
+    expect(st.status).toBe("riding");
+    expect(st.lastError).toBeFalsy();
   });
 });

@@ -39,8 +39,18 @@ export function mount(env: Env, sessionId: string): Sandbox {
 /** One-shot HTTP call to koboi serve FROM INSIDE the Mount (localhost) via SDK exec (RPC).
  *  Sidesteps the Worker->container HTTP problem entirely. Returns {status, body}.
  *  `body` (optional) is JSON-encoded, base64-wrapped, and sent with Content-Type: application/json
- *  (base64 keeps it shell-safe). `timeoutMs` defaults to 30s; raise it for the first /v1/jobs submit
- *  (pool.get_or_create builds the agent + MCP server). */
+ *  (base64 keeps it shell-safe and lets any UTF-8 -- emoji/CJK -- round-trip). `timeoutMs` is the
+ *  budget for BOTH the SDK exec wrapper AND the in-container urllib read: it is threaded into the
+ *  Python `urllib.request.urlopen(timeout=...)`, so raising it actually extends the HTTP call -- the
+ *  first /v1/jobs submit needs the headroom because pool.get_or_create builds the agent + MCP server. */
+function b64encodeUtf8(s: string): string {
+  // btoa is Latin1-only; encode UTF-8 -> bytes -> binary string -> base64 so non-ASCII chat works.
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
 async function httpInMount(
   sb: Sandbox,
   method: string,
@@ -49,7 +59,8 @@ async function httpInMount(
   timeoutMs = 30000,
 ): Promise<{ status: number; body: unknown }> {
   const hasBody = body !== undefined;
-  const bodyB64 = hasBody ? btoa(JSON.stringify(body)) : "";
+  const bodyB64 = hasBody ? b64encodeUtf8(JSON.stringify(body)) : "";
+  const httpTimeoutSec = Math.max(1, Math.floor(timeoutMs / 1000));
   const py = [
     "import json,urllib.request,urllib.error,base64",
     `url="http://localhost:${MOUNT_PORT}${path}"`,
@@ -57,17 +68,29 @@ async function httpInMount(
     `req=urllib.request.Request(url,data=data,method="${method}")`,
     hasBody ? `req.add_header("Content-Type","application/json")` : "pass",
     "try:",
-    "  r=urllib.request.urlopen(req,timeout=20); print(json.dumps({'status':r.status,'body':json.loads(r.read().decode() or 'null')}))",
-    "except urllib.error.HTTPError as e: print(json.dumps({'status':e.code,'body':e.read().decode()}))",
+    `  r=urllib.request.urlopen(req,timeout=${httpTimeoutSec}); print(json.dumps({'status':r.status,'body':json.loads(r.read().decode() or 'null')}))`,
+    "except urllib.error.HTTPError as e:",
+    "  raw=e.read()",
+    "  try: body=json.loads(raw.decode() or 'null')",
+    "  except Exception: body=raw.decode('utf-8','replace')",
+    "  print(json.dumps({'status':e.code,'body':body}))",
     "except Exception as e: print(json.dumps({'status':0,'body':'ERR: '+str(e)}))",
   ].join("\n");
-  const b64 = btoa(py);
+  const b64 = b64encodeUtf8(py);
   const res = await sb.exec(`python3 -c "import base64;exec(base64.b64decode('${b64}'))"`, { timeout: timeoutMs });
+  // A non-zero exit (python3 missing / OOM / SDK RPC failure) leaves no JSON line -- surface stderr.
+  if (res.exitCode !== 0) {
+    return { status: 0, body: `exec exit ${res.exitCode}: stderr=${(res.stderr || "").trim().slice(0, 400)}` };
+  }
   const line = (res.stdout || "").trim().split("\n").pop() || "{}";
   try {
     return JSON.parse(line) as { status: number; body: unknown };
   } catch {
-    return { status: 0, body: `parse error: ${(res.stdout || "").slice(0, 200)}` };
+    // Include stderr so a Python traceback (the real cause) isn't lost behind an empty parse error.
+    return {
+      status: 0,
+      body: `parse error: stdout=${(res.stdout || "").slice(0, 200)} stderr=${(res.stderr || "").slice(0, 200)}`,
+    };
   }
 }
 
@@ -115,21 +138,43 @@ export async function createSession(env: Env, sessionId: string): Promise<string
 }
 
 export interface KoboiJobSubmit {
-  message: string;
+  message: string; // non-empty enforced by the POST /lifecycle/chat handler
   mode?: string; // omit -> server uses the config default (finance.yaml mode: act)
   max_iterations?: number;
 }
 
+/** koboi job lifecycle states (koboi 0.19.1 GET /v1/jobs/{id}). */
+export type KoboiJobStatus =
+  | "reserved"
+  | "pending"
+  | "running"
+  | "completed"
+  | "cancelled"
+  | "timed_out"
+  | "awaiting_human"
+  | "failed";
+
 export interface KoboiJobHandle {
   job_id: string;
-  status: string; // "pending" on a fresh submit
+  status: KoboiJobStatus; // "pending" on a fresh submit
   session_id: string;
 }
 
+/** GET /v1/jobs/{id} response body. */
+export interface JobStatusResponse {
+  job_id: string;
+  status: KoboiJobStatus;
+  session_id: string;
+  result?: unknown;
+  error?: string;
+  error_class?: string;
+  retriable?: boolean;
+}
+
 /** Submit an async chat job (POST /v1/jobs) that CONTINUES session `koboiSid` -- the key to
- *  conversation continuity across suspend/resume. A plain job also materializes the pooled agent
- *  at submit (koboi app.py pool.get_or_create), which is why GET /v1/sessions/{id} stops 404-ing
- *  after a chat. Returns the job handle; the caller polls with pollChatJob(). */
+ *  conversation continuity across suspend/resume. On koboi 0.19.1 a plain job also materializes the
+ *  pooled agent at submit, after which GET /v1/sessions/{id} returns 200 instead of 404.
+ *  Returns the job handle; the caller polls with pollChatJob(). */
 export async function submitChatJob(
   env: Env,
   sessionId: string,
@@ -141,7 +186,7 @@ export async function submitChatJob(
     "POST",
     "/v1/jobs",
     { message: job.message, session_id: koboiSid, mode: job.mode, max_iterations: job.max_iterations },
-    60000, // first submit builds the agent + MCP server -- give it headroom
+    60000, // first submit builds the agent + MCP server -- give it headroom (now also extends the urllib read)
   );
   if (out.status !== 202) {
     throw new Error(`/v1/jobs returned ${out.status}: ${JSON.stringify(out.body).slice(0, 200)}`);
@@ -151,19 +196,18 @@ export async function submitChatJob(
   return h;
 }
 
-/** Poll a koboi job (GET /v1/jobs/{id}). body = JobStatusResponse
- *  {job_id, status, session_id, result?, error?, error_class?, retriable?}.
- *  status in: reserved|pending|running|completed|cancelled|timed_out|awaiting_human|failed. */
+/** Poll a koboi job (GET /v1/jobs/{id}). Returns the HTTP status + JobStatusResponse body; throws
+ *  on any non-200 so callers don't mistake a transport failure (status 0) for a koboi response. */
 export async function pollChatJob(
   env: Env,
   sessionId: string,
   jobId: string,
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: JobStatusResponse }> {
   const out = await httpInMount(mount(env, sessionId), "GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   if (out.status !== 200) {
     throw new Error(`/v1/jobs/${jobId} returned ${out.status}: ${JSON.stringify(out.body).slice(0, 200)}`);
   }
-  return out;
+  return out as { status: number; body: JobStatusResponse };
 }
 
 export interface DismountResult {
