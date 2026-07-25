@@ -24,8 +24,8 @@ infra, end to end. Everything below is exercised by [`demo/roundtrip.sh`](../dem
 
 | Area | Status | Notes |
 |---|---|---|
-| Client chat **streaming** (the data plane) | 🔴 | `POST /chat/stream` + `/v1/*` return `501 data_plane_not_wired`. Needs a **public Mount URL** (Cloudflare Tunnel / `exposePort` / custom domain) so the browser can stream from `koboi serve`. The control plane staying on SDK RPC is what makes the .workers.dev proof possible today; the data plane can't follow the same trick. |
-| Public Mount URL plumbing | 🔴 | Tunnel/exposePort wiring + routing chat traffic to the right per-session Mount. |
+| Client chat **streaming** (the data plane) | 🔴 | `POST /chat/stream` + `/v1/*` return `501 data_plane_not_wired`. The first wiring step is missing: `proxyToSandbox(request, env)` is not yet called (the fetch() at `outrider/src/index.ts:22-39` jumps straight to the 501 stub). The planned Wave-1 approach (feasibility under review): `proxyToSandbox` gate + `exposePort(8000, {hostname, token:sid})` re-activated on remount + custom domain + wildcard DNS. Quick tunnels (`*.trycloudflare.com`) are ruled out: (a) they buffer SSE responses (token streaming would not stream), and (b) the URL does not survive container restarts (DO storage clears on `onStart`, so every dismount→remount yields a fresh URL). Note: `koboi serve` runs on port 8000 but the Sandbox DO `defaultPort` is 3000 — `exposePort` must specify port 8000. |
+| Public Mount URL plumbing | 🔴 | `proxyToSandbox` gate (currently missing — the first step) + `exposePort(8000, {hostname, token:sid})` re-activated on each remount + custom domain with wildcard DNS (e.g., `*.sessions.yourdomain.com` → `proxyToSandbox` → session-specific preview URL). Sub-items: `defaultPort(3000≠8000)` mismatch requires `exposePort(8000, ...)`; `keepAlive` not set (`getSandbox` called with no options) — consider setting for active chat streams so the DO alarm doesn't sleep the container mid-token (under RPC transport, `onSessionBusy`/`onSessionIdle` auto-renew during in-flight streams). |
 
 ## Wave-1b — operational hardening
 
