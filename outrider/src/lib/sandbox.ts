@@ -142,10 +142,13 @@ async function stopServe(sb: Sandbox): Promise<void> {
   await sb.exec("pkill -TERM -f 'koboi serve' || true", { timeout: 15000 });
 }
 
-async function swapSnapshot(sb: Sandbox, sid: string): Promise<void> {
-  const snap = `${MOUNT_DB}.${sid}.suspend.db`;
+async function swapSnapshot(sb: Sandbox): Promise<void> {
+  // /suspend names the consistent snapshot `koboi_memory.db.<KODOI sid>.suspend.db`, but the Range
+  // session id is what we have here -- they differ. Glob the (single, per-Mount) *.suspend.db rather
+  // than name-matching the wrong id (the old `[ -f <range-sid>.suspend.db ]` never matched -> the mv
+  // was skipped -> rm deleted the restored DB -> koboi serve booted fresh+empty -> data lost).
   await sb.exec(
-    `sh -c 'rm -f ${MOUNT_DB} ${MOUNT_DB}-wal ${MOUNT_DB}-shm; [ -f ${snap} ] && mv ${snap} ${MOUNT_DB} || true'`,
+    `sh -c 'rm -f ${MOUNT_DB} ${MOUNT_DB}-wal ${MOUNT_DB}-shm; mv ${MOUNT_DB}.*.suspend.db ${MOUNT_DB} 2>/dev/null || true'`,
     { timeout: 15000 },
   );
 }
@@ -156,7 +159,7 @@ export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBac
   const sb = mount(env, sessionId);
   if (saddlebag) {
     await sb.restoreBackup(saddlebag);
-    await swapSnapshot(sb, sessionId);
+    await swapSnapshot(sb);
   }
   await waitReady(await startServe(sb, env));
   return exposeStream(sb, env, sessionId); // (re)activate the streaming preview URL for this runtime
@@ -279,7 +282,7 @@ export async function remount(env: Env, sessionId: string, saddlebag: DirectoryB
   const sb = mount(env, sessionId);
   await stopServe(sb);
   await sb.restoreBackup(saddlebag);
-  await swapSnapshot(sb, sessionId);
+  await swapSnapshot(sb);
   await waitReady(await startServe(sb, env));
   return exposeStream(sb, env, sessionId); // re-activate the SAME preview URL for the fresh runtime
 }
