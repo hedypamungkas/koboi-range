@@ -48,7 +48,8 @@ HDRS=(-H 'content-type: application/json' -H 'accept: text/event-stream')
 ESC_MSG="$(printf '%s' "$MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 
 # -N disables curl's output buffering -- the whole point: frames must flush as they arrive.
-curl -N -sS -X POST "$STREAM_URL" "${HDRS[@]}" -d "{\"message\":\"$ESC_MSG\"}"
+# streamUrl is the host root; append the koboi SSE endpoint path.
+curl -N -sS -X POST "${STREAM_URL%/}/v1/chat/stream" "${HDRS[@]}" -d "{\"message\":\"$ESC_MSG\"}"
 printf '\n\033[1;32m--- end stream ---\033[0m\n'
 
 say "done. If the 'data: {...}' frames printed one-by-one (not as one blob), live-token streaming works."

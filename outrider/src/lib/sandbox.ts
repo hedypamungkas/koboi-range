@@ -25,6 +25,11 @@ export interface Env {
   MOUNT_CONFIG: string;
   /** Worker's public hostname (custom domain) -- exposePort() mints the streaming preview URL under it. */
   PUBLIC_DOMAIN: string;
+  // LLM secrets for the Mount (set via `wrangler secret put`). Worker secrets do NOT auto-reach the
+  // container in this Sandbox-SDK setup, so startServe injects them into the koboi process env.
+  OPENAI_API_KEY: string;
+  OPENAI_BASE_URL: string;
+  OPENAI_MODEL: string;
 }
 
 export const SADDLEBAG_DIR = "/workspace";
@@ -114,7 +119,18 @@ async function httpInMount(
 }
 
 async function startServe(sb: Sandbox, env: Env): Promise<Process> {
-  return sb.startProcess(`koboi serve ${mountConfig(env)}`);
+  // Inject the LLM secrets into the koboi serve process env. Worker secrets (`wrangler secret put`)
+  // do not auto-propagate to the container in this Sandbox-SDK setup; prefixing the shell command sets
+  // them for the koboi process. Single-quoted -- API keys / base_urls are [A-Za-z0-9._:/-], safe.
+  const llmEnv = [
+    `OPENAI_API_KEY='${env.OPENAI_API_KEY ?? ""}'`,
+    `OPENAI_BASE_URL='${env.OPENAI_BASE_URL ?? ""}'`,
+    `OPENAI_MODEL='${env.OPENAI_MODEL ?? ""}'`,
+  ].join(" ");
+  // --host 0.0.0.0 is REQUIRED: koboi serve defaults to 127.0.0.1, which httpInMount/waitReady reach
+  // via localhost, but the SDK's preview-forward (proxyToSandbox) connects via the container's network
+  // IP (e.g. 10.0.0.1:8000) -- localhost-only bind => "container is not listening in TCP address".
+  return sb.startProcess(`${llmEnv} koboi serve ${mountConfig(env)} --host 0.0.0.0 --port ${MOUNT_PORT}`);
 }
 
 /** Wait for koboi serve's /healthz via the SDK's internal port check (not Worker HTTP). */
