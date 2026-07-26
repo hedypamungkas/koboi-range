@@ -27,7 +27,19 @@ const sdk = vi.hoisted(() => {
     dir: opts?.dir ?? "/workspace",
   }));
   const restoreBackup = vi.fn(async () => ({}));
-  return { exec, startProcess, createBackup, restoreBackup, Sandbox: class MockSandbox {} };
+  const exposePort = vi.fn(async (port: number, opts?: { hostname?: string; token?: string }) => ({
+    url: `https://${port}-s1-${opts?.token ?? "t"}.range.example.com`,
+    port,
+    name: undefined as string | undefined,
+  }));
+  // Mirror the SDK's extractSandboxRoute: only <port>-<id>-<token>.<host> subdomains are proxied;
+  // everything else returns null so the Worker falls through. Lets routing tests prove the proxy gate
+  // takes precedence over the 501 hint (full DO-proxy bytes still need a real deploy).
+  const proxyToSandbox = vi.fn(async (req: Request): Promise<Response | null> => {
+    const sub = new URL(req.url).hostname.split(".")[0] ?? "";
+    return /^\d{4,5}-.+-.+$/.test(sub) ? new Response("proxied:" + new URL(req.url).pathname, { status: 200 }) : null;
+  });
+  return { exec, startProcess, createBackup, restoreBackup, exposePort, proxyToSandbox, Sandbox: class MockSandbox {} };
 });
 
 vi.mock("@cloudflare/sandbox", () => ({
@@ -36,7 +48,9 @@ vi.mock("@cloudflare/sandbox", () => ({
     startProcess: sdk.startProcess,
     createBackup: sdk.createBackup,
     restoreBackup: sdk.restoreBackup,
+    exposePort: sdk.exposePort,
   }),
+  proxyToSandbox: sdk.proxyToSandbox,
   Sandbox: sdk.Sandbox,
 }));
 

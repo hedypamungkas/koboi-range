@@ -41,7 +41,11 @@
   "vars": {
     "BACKUP_BUCKET_NAME": "range-saddlebags",
     "CLOUDFLARE_ACCOUNT_ID": "<YOUR_ACCOUNT_ID>",
-    "MOUNT_CONFIG": "/app/config/finance.yaml"
+    "MOUNT_CONFIG": "/app/config/finance.yaml",
+    // PUBLIC_DOMAIN = the Worker's public hostname (custom domain). exposePort() mints the live-token
+    // streaming preview URL under it. Required before deploying Wave-1; pair with wildcard DNS
+    // *.range.<yourdomain> -> this Worker so <port>-<sid>-<token>.range.<yourdomain> resolves.
+    "PUBLIC_DOMAIN": "<YOUR_PUBLIC_DOMAIN e.g. range.yourdomain.com>"
   },
 
   // The Range heartbeat -- 1/min, same cadence as the Devin Outposts template.

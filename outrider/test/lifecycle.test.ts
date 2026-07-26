@@ -5,7 +5,7 @@ import { ride, dismount, remount } from "../src/lib/sandbox";
 import { sandboxSpy } from "./_sdk-mock";
 
 // Lifecycle fns only touch env.MOUNT_CONFIG (env.Sandbox is consumed by the mocked getSandbox).
-const env = { MOUNT_CONFIG: "/app/config/finance.yaml" } as never;
+const env = { MOUNT_CONFIG: "/app/config/finance.yaml", PUBLIC_DOMAIN: "range.example.com" } as never;
 
 const saddlebag = { id: "bk-1", name: "s1", dir: "/workspace" } as never;
 
@@ -14,20 +14,25 @@ beforeEach(() => {
   sandboxSpy.startProcess.mockClear();
   sandboxSpy.createBackup.mockClear();
   sandboxSpy.restoreBackup.mockClear();
+  sandboxSpy.exposePort.mockClear();
 });
 
 describe("ride", () => {
-  it("fresh ride (no saddlebag): starts serve, never restores or backs up", async () => {
-    await ride(env, "s1", null);
+  it("fresh ride (no saddlebag): starts serve, never restores or backs up, mints the stream URL", async () => {
+    const streamUrl = await ride(env, "s1", null);
     expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
     expect(sandboxSpy.restoreBackup).not.toHaveBeenCalled();
     expect(sandboxSpy.createBackup).not.toHaveBeenCalled();
+    expect(sandboxSpy.exposePort).toHaveBeenCalledTimes(1);
+    expect(sandboxSpy.exposePort).toHaveBeenCalledWith(8000, { hostname: "range.example.com", token: "s1" });
+    expect(streamUrl).toContain("8000");
   });
 
-  it("resume ride (saddlebag): restores the snapshot, then starts serve", async () => {
+  it("resume ride (saddlebag): restores the snapshot, then starts serve, mints the stream URL", async () => {
     await ride(env, "s1", saddlebag);
     expect(sandboxSpy.restoreBackup).toHaveBeenCalledTimes(1);
     expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    expect(sandboxSpy.exposePort).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -43,9 +48,12 @@ describe("dismount", () => {
 });
 
 describe("remount", () => {
-  it("stop -> restore -> swap -> start serve", async () => {
-    await remount(env, "s1", saddlebag);
+  it("stop -> restore -> swap -> start serve -> re-activate the stream URL", async () => {
+    const streamUrl = await remount(env, "s1", saddlebag);
     expect(sandboxSpy.restoreBackup).toHaveBeenCalledTimes(1);
     expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    expect(sandboxSpy.exposePort).toHaveBeenCalledTimes(1); // re-activated for the fresh runtime
+    expect(sandboxSpy.exposePort).toHaveBeenCalledWith(8000, { hostname: "range.example.com", token: "s1" });
+    expect(streamUrl).toContain("8000");
   });
 });

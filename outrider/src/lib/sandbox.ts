@@ -6,7 +6,7 @@
 //   - readiness: proc.waitForPort(8000, {path:'/healthz', status:200})  (SDK-internal port check)
 //   - /suspend + session create/verify: httpInMount() runs a one-shot HTTP call FROM INSIDE the
 //     container (localhost:8000) via sb.exec -- RPC, not Worker->container HTTP.
-// Client chat streaming (data plane) needs a public Mount URL (tunnel/exposePort) -> Wave-1.
+// Live-token streaming (data plane): proxyToSandbox + exposePort(8000) -> stable per-session preview URL (Wave-1).
 //
 // Verified against @cloudflare/sandbox@0.12.4: getSandbox, createBackup, restoreBackup,
 // startProcess->Process.waitForPort, exec. koboi 0.19.1: POST /v1/sessions/{id}/suspend ->
@@ -23,6 +23,8 @@ export interface Env {
   BACKUP_BUCKET_NAME: string;
   CLOUDFLARE_ACCOUNT_ID: string;
   MOUNT_CONFIG: string;
+  /** Worker's public hostname (custom domain) -- exposePort() mints the streaming preview URL under it. */
+  PUBLIC_DOMAIN: string;
 }
 
 export const SADDLEBAG_DIR = "/workspace";
@@ -34,6 +36,21 @@ const mountConfig = (env: Env) => env.MOUNT_CONFIG || "/app/config/finance.yaml"
 /** A Mount = the per-session Sandbox/container, named by session id. */
 export function mount(env: Env, sessionId: string): Sandbox {
   return getSandbox(env.Sandbox, sessionId);
+}
+
+/** Stable preview-URL token for `sid`. The SDK requires `[a-z0-9_]{1,16}`; raw session ids violate
+ *  that (hyphens, length), so sanitize deterministically -> the URL is predictable AND identical
+ *  across remounts (proxyToSandbox re-activates the same URL each ride/remount). */
+export function streamToken(sid: string): string {
+  return sid.toLowerCase().replace(/[^a-z0-9]/g, "_").slice(0, 16) || "s";
+}
+
+/** Expose koboi serve's streaming port on a stable per-session preview URL. Per the SDK, forwarding
+ *  is active only for the runtime where it was last called -> re-invoke on every ride/remount.
+ *  Returns the minted URL (https://<port>-<sid>-<token>.<PUBLIC_DOMAIN>). */
+export async function exposeStream(sb: Sandbox, env: Env, sid: string): Promise<string> {
+  const { url } = await sb.exposePort(MOUNT_PORT, { hostname: env.PUBLIC_DOMAIN, token: streamToken(sid) });
+  return url;
 }
 
 /** One-shot HTTP call to koboi serve FROM INSIDE the Mount (localhost) via SDK exec (RPC).
@@ -119,13 +136,14 @@ async function swapSnapshot(sb: Sandbox, sid: string): Promise<void> {
 
 /** RIDE: boot the Mount (keep-alive), restore+swap a prior Saddlebag if present, start koboi
  *  serve, wait for readiness. (First ride: no saddlebag -> fresh DB, no swap.) */
-export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null): Promise<void> {
+export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null): Promise<string> {
   const sb = mount(env, sessionId);
   if (saddlebag) {
     await sb.restoreBackup(saddlebag);
     await swapSnapshot(sb, sessionId);
   }
   await waitReady(await startServe(sb, env));
+  return exposeStream(sb, env, sessionId); // (re)activate the streaming preview URL for this runtime
 }
 
 /** Create a koboi session inside the Mount; returns the koboi session_id. */
@@ -241,12 +259,13 @@ export async function dismount(env: Env, sessionId: string, koboiSid: string): P
 }
 
 /** REMOUNT: stop any lingering serve -> restore Saddlebag -> swap -> start serve -> ready. */
-export async function remount(env: Env, sessionId: string, saddlebag: DirectoryBackup): Promise<void> {
+export async function remount(env: Env, sessionId: string, saddlebag: DirectoryBackup): Promise<string> {
   const sb = mount(env, sessionId);
   await stopServe(sb);
   await sb.restoreBackup(saddlebag);
   await swapSnapshot(sb, sessionId);
   await waitReady(await startServe(sb, env));
+  return exposeStream(sb, env, sessionId); // re-activate the SAME preview URL for the fresh runtime
 }
 
 /** Verify: GET the koboi session's messages (proves the restored/swapped DB is live). */

@@ -19,6 +19,7 @@ export interface SessionRecord {
   lastError?: string | null;
   lastCheckpointOk?: boolean | null; // from the /suspend checkpoint on the last dismount
   koboiSessionId?: string | null; // the koboi session id created inside this Mount (for /suspend + verify)
+  streamUrl?: string | null; // the exposePort() preview URL for live-token SSE streaming
 }
 
 const PREFIX = "range:session:";

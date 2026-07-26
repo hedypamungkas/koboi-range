@@ -213,14 +213,14 @@ for the Wave-0 → Wave-1b TODO list.
 - **Control plane is all SDK RPC (no Worker→container HTTP).** Readiness uses
   `proc.waitForPort(8000, {path:"/healthz"})`; `/suspend` + session create/verify run a one-shot
   HTTP call **from inside the Mount** (localhost:8000) via `sb.exec`. This is why it works on
-  `.workers.dev` (no `exposePort`/tunnel/custom-domain). Client chat **streaming** (the data
-  plane) needs a public Mount URL — Wave-1 (`POST /chat/stream` returns 501 for now). The first
-  wiring step is missing: `proxyToSandbox(request, env)` is not yet called (the fetch() at
-  `outrider/src/index.ts:22-39` jumps straight to the 501 stub). The planned Wave-1 approach
-  (feasibility under review) is `proxyToSandbox` + `exposePort(8000, {hostname, token:sid})`
-  on a custom domain with wildcard DNS. Quick tunnels (`*.trycloudflare.com`) are unsuitable:
-  they buffer SSE responses (token streaming would not stream) and the URL does not survive
-  container restarts (DO storage clears on `onStart`, so every dismount→remount yields a fresh URL).
+  `.workers.dev` (no `exposePort`/tunnel/custom-domain). Live-token chat **streaming** (the data
+  plane) is wired over a public Mount URL: `proxyToSandbox(request, env)` gates `fetch()` and
+  proxies `<port>-<sid>-<token>.<PUBLIC_DOMAIN>` subdomains straight to the per-session Mount's
+  `koboi serve` (unbuffered body → SSE `/v1/chat/stream` flows token-by-token); `exposePort(8000,
+  {hostname, token})` is re-activated on every `ride`/`remount` so the preview URL is **stable and
+  survives suspend/resume**. Requires `PUBLIC_DOMAIN` + wildcard DNS `*.range.<domain>` (a deploy
+  step); live token-by-token delivery still wants a `curl -N` smoke check. Quick tunnels
+  (`*.trycloudflare.com`) are unsuitable: they buffer SSE and the URL churns every remount.
 - **`pending_approval` observation is via a webhook receiver** (`/lifecycle/observe/:sid`).
   Wire the Mount's `jobs.webhooks` / `handover.webhooks` to POST there. (Polling the Mount's job
   status from the cron is the alternative.)

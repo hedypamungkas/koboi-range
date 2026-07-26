@@ -12,10 +12,12 @@
 //   chat  POST /lifecycle/chat/<sid>            -> 202 {job_id} (koboi /v1/jobs, continues the session)
 //         GET  /lifecycle/chat/<sid>/<job_id>   -> JobStatusResponse (poll until terminal)
 //   awaiting_human on poll flips the registry so the cron dismounts (~$0 while the controller reviews).
-// Live-token STREAMING (POST /chat/stream) still needs a public Mount URL -> Wave-1 streaming.
+// Live-token STREAMING (data plane): proxyToSandbox proxies <port>-<sid>-<token>.<domain> -> Mount;
+//   exposePort(8000) (re)mints the per-session preview URL on each ride/remount (Wave-1, wired).
 
 import type { Env } from "./lib/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
+import { proxyToSandbox } from "@cloudflare/sandbox";
 
 import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, KOBOI_JOB_STATUSES } from "./lib/sandbox";
 import * as reg from "./lib/registry";
@@ -35,11 +37,18 @@ export default {
     );
     if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env, m[3] ? decodeURIComponent(m[3]) : undefined);
 
-    // Chat STREAMING (data plane, live tokens): needs a public Mount URL (tunnel/exposePort) -- Wave-1 streaming.
-    // Non-streaming chat (submit + poll) IS wired: POST /lifecycle/chat/<sid>, GET /lifecycle/chat/<sid>/<job_id>.
+    // Live-token STREAMING (data plane): subdomain-shaped preview URLs (<port>-<sid>-<token>.<domain>)
+    // are proxied straight to the per-session Mount's `koboi serve` by proxyToSandbox -- its body is
+    // streamed unbuffered (TransformStream passthrough), so SSE /v1/chat/stream flows token-by-token.
+    // Returns null for non-preview hostnames -> fall through to the 501 hint below.
+    const proxy = await proxyToSandbox(req, env);
+    if (proxy) return proxy;
+
+    // Bare-hostname hit on /chat/stream or /v1/* (no preview URL) -> point the client at the
+    // per-session preview URL (or the non-streaming submit+poll path).
     const sid = req.headers.get("X-Session-Id");
     if (sid && (url.pathname === "/chat/stream" || url.pathname.startsWith("/v1/"))) {
-      return json({ error: "streaming_not_wired", detail: "live-token streaming needs a public Mount URL (tunnel/exposePort) -- Wave-1 streaming. Use POST /lifecycle/chat/<sid> (submit) + GET /lifecycle/chat/<sid>/<job_id> (poll) for non-streaming chat." }, 501);
+      return json({ error: "use_preview_url", detail: "live-token streaming is served at the per-session preview URL minted by exposePort (https://<port>-<sid>-<token>.<PUBLIC_DOMAIN>). For non-streaming chat use POST /lifecycle/chat/<sid> (submit) + GET /lifecycle/chat/<sid>/<job_id> (poll)." }, 501);
     }
 
     return json({ error: "not found", path: url.pathname }, 404);
@@ -84,15 +93,15 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     }
     case "ride": {
       const existing = await reg.get(env, sid);
-      await ride(env, sid, existing?.saddlebag ?? null);
-      await reg.setStatus(env, sid, "riding", { saddlebag: existing?.saddlebag ?? null });
-      return json({ sid, action: "ride", status: "riding" });
+      const streamUrl = await ride(env, sid, existing?.saddlebag ?? null);
+      await reg.setStatus(env, sid, "riding", { saddlebag: existing?.saddlebag ?? null, streamUrl });
+      return json({ sid, action: "ride", status: "riding", streamUrl });
     }
     case "session": {
-      await ride(env, sid, (await reg.get(env, sid))?.saddlebag ?? null); // ensure Mount is up
+      const streamUrl = await ride(env, sid, (await reg.get(env, sid))?.saddlebag ?? null); // ensure Mount is up
       const koboiSid = await createSession(env, sid);
-      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid });
-      return json({ sid, action: "session", koboiSessionId: koboiSid, status: "riding" });
+      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, streamUrl });
+      return json({ sid, action: "session", koboiSessionId: koboiSid, status: "riding", streamUrl });
     }
     case "chat": {
       // POLL: GET /lifecycle/chat/<sid>/<job_id>
@@ -144,9 +153,10 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
       // skipping ride if already riding (avoids a redundant `koboi serve` spawn on repeat chats).
       const existing = await reg.get(env, sid);
       let koboiSid = existing?.koboiSessionId ?? null;
-      if (existing?.status !== "riding") await ride(env, sid, existing?.saddlebag ?? null);
+      let streamUrl: string | undefined;
+      if (existing?.status !== "riding") streamUrl = await ride(env, sid, existing?.saddlebag ?? null);
       if (!koboiSid) koboiSid = await createSession(env, sid);
-      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, lastError: null });
+      await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, lastError: null, ...(streamUrl ? { streamUrl } : {}) });
       const job = await submitChatJob(env, sid, koboiSid, {
         message: body.message,
         mode: body.mode,
@@ -173,9 +183,9 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     case "remount": {
       const rec = await reg.get(env, sid);
       if (!rec?.saddlebag) return json({ error: "no saddlebag to remount" }, 400);
-      await remount(env, sid, rec.saddlebag);
-      await reg.setStatus(env, sid, "riding");
-      return json({ sid, action: "remount", status: "riding" });
+      const streamUrl = await remount(env, sid, rec.saddlebag);
+      await reg.setStatus(env, sid, "riding", { streamUrl });
+      return json({ sid, action: "remount", status: "riding", streamUrl });
     }
     case "messages": {
       const rec = await reg.get(env, sid);
