@@ -273,10 +273,19 @@ export async function sessionMessages(env: Env, _sessionId: string, koboiSid: st
   return httpInMount(mount(env, _sessionId), "GET", `/v1/sessions/${encodeURIComponent(koboiSid)}`);
 }
 
-/** RETIRE: stop serve + drop the Saddlebag record. (Explicit container destroy = Wave-1b.) */
+/** RETIRE: revoke the preview URL + stop serve. (The Saddlebag-record drop is registry-side, in
+ *  the caller; explicit container destroy = Wave-1b.) `unexposePort` is idempotent DO-state cleanup
+ *  -- the SDK does not contact/wake/probe the container for it, so it's safe even if the port was
+ *  never exposed or the container is already gone. */
 export async function retire(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null) {
+  const sb = mount(env, sessionId);
   try {
-    await stopServe(mount(env, sessionId));
+    await sb.unexposePort(MOUNT_PORT); // revoke the streaming preview URL (best-effort, idempotent)
+  } catch {
+    /* port may never have been exposed, or the DO is already gone */
+  }
+  try {
+    await stopServe(sb);
   } catch {
     /* best-effort */
   }

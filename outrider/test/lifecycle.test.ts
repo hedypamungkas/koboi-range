@@ -1,7 +1,7 @@
 // Lifecycle functions (ride/dismount/remount) against the mocked Mount: assert the SDK call
 // sequence + the returned handles, proving the suspend/resume wiring without a real container.
 import { describe, it, expect, beforeEach } from "vitest";
-import { ride, dismount, remount } from "../src/lib/sandbox";
+import { ride, dismount, remount, retire } from "../src/lib/sandbox";
 import { sandboxSpy } from "./_sdk-mock";
 
 // Lifecycle fns only touch env.MOUNT_CONFIG (env.Sandbox is consumed by the mocked getSandbox).
@@ -15,6 +15,7 @@ beforeEach(() => {
   sandboxSpy.createBackup.mockClear();
   sandboxSpy.restoreBackup.mockClear();
   sandboxSpy.exposePort.mockClear();
+  sandboxSpy.unexposePort.mockClear();
 });
 
 describe("ride", () => {
@@ -55,5 +56,13 @@ describe("remount", () => {
     expect(sandboxSpy.exposePort).toHaveBeenCalledTimes(1); // re-activated for the fresh runtime
     expect(sandboxSpy.exposePort).toHaveBeenCalledWith(8000, { hostname: "range.example.com", token: "s1" });
     expect(streamUrl).toContain("8000");
+  });
+});
+
+describe("retire", () => {
+  it("revokes the preview URL + stops serve (best-effort)", async () => {
+    await retire(env, "s1");
+    expect(sandboxSpy.unexposePort).toHaveBeenCalledWith(8000); // revoke the streaming preview URL
+    expect(sandboxSpy.exec).toHaveBeenCalledTimes(1); // stopServe -> pkill koboi serve
   });
 });
