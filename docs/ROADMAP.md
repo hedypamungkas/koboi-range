@@ -15,7 +15,7 @@ infra, end to end. Everything below is exercised by [`demo/roundtrip.sh`](../dem
 |---|---|---|
 | Outrider control plane (ride/dismount/remount/retire/status/observe) | ✅ | All SDK RPC — works on `.workers.dev`, no tunnel/exposePort needed. |
 | Range heartbeat cron (1/min) | ✅ | Drives `awaiting_human`→dismount, `resuming`→remount, `done`→retire. |
-| Consistent snapshot on dismount | ✅ | Via koboi 0.19.1 `POST /v1/sessions/{id}/suspend` (sqlite3 Online Backup API) — atomicity-independent. |
+| Consistent snapshot on dismount | ✅ | Via koboi 0.19.2 `POST /v1/sessions/{id}/suspend` (sqlite3 Online Backup API) — atomicity-independent. |
 | Saddlebag → R2 (`createBackup({dir:"/workspace"})`) | 🟡 | Uses the FUSE-overlay `createBackup`/`restoreBackup` flow; native disk-suspend is the eventual target (same API going forward). |
 | `pending_approval` observation | 🟡 | Webhook receiver `/lifecycle/observe/:sid`. You must wire the Mount's `jobs.webhooks`/`handover.webhooks` to POST there (polling the Mount's job status from the cron is the alternative). |
 | Unit + integration tests | ✅ | `npm test` — KV/cron/routing/lifecycle covered with the Sandbox SDK mocked; no Cloudflare account needed to run. |

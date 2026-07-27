@@ -25,7 +25,7 @@ This is the same deployment pattern as **Devin Outposts** (per-session container
 scale-to-zero, suspend/resume via FS snapshot) — but the agent **brain is yours** (open Python,
 BYO-LLM), not a closed vendor cloud.
 
-> **Wave-0 status — proof scaffold, not production.** Wired to **koboi-agent 0.19.1**'s
+> **Wave-0 status — proof scaffold, not production.** Wired to **koboi-agent 0.19.2**'s
 > `POST /v1/sessions/{id}/suspend` (atomicity-independent `sqlite3` backup). Deps install and
 > `tsc --noEmit` pass clean against `@cloudflare/sandbox@0.12.4`. Remaining gaps are
 > **operational** (CF account / KV / R2 / secrets). See [Honest caveats](#honest-caveats).
@@ -205,7 +205,7 @@ for the Wave-0 → Wave-1b TODO list.
   `BackupOptions.dir` **must** be under `/workspace`·`/home`·`/tmp`·`/var/tmp`·`/app` (not `/data`)
   — hence the Saddlebag root is `/workspace`. Per-instance container teardown (`sb.stop()`/destroy)
   is still a Wave-1b TODO (today: TTL auto-GC + idle scale-to-zero).
-- **Consistency is via koboi 0.19.1 `/suspend`, not WAL quiesce.** On dismount the Outrider calls
+- **Consistency is via koboi 0.19.2 `/suspend`, not WAL quiesce.** On dismount the Outrider calls
   `POST /v1/sessions/{id}/suspend`, which writes a **consistent** snapshot via the sqlite3 Online
   Backup API (atomicity-independent — safe even while other connections write). The Outrider then
   `createBackup`s `/workspace` (capturing that file + workdir + audit). On resume it restores +
@@ -233,7 +233,7 @@ for the Wave-0 → Wave-1b TODO list.
 
 ## Relation to the koboi ecosystem
 
-- **[koboi-agent](https://github.com/hedypamungkas/koboi-agent)** — the brain (consumed as `koboi-agent[api]==0.19.1` in the Mount image). The `POST /v1/sessions/{id}/suspend` endpoint + `SQLiteMemory.consistent_backup()` this repo consumes shipped in **0.19.1** (PR #98).
+- **[koboi-agent](https://github.com/hedypamungkas/koboi-agent)** — the brain (consumed as `koboi-agent[api]==0.19.2` in the Mount image). The `POST /v1/sessions/{id}/suspend` endpoint + `SQLiteMemory.consistent_backup()` this repo consumes shipped in **0.19.1** (PR #98); GET /v1/sessions/{id} surviving a serve restart (the suspend/resume fix) shipped in **0.19.2** (PR #103).
 - **koboi-use-cases** — the sector apps (finance-reconciliation is the demo use case vendored here). Sibling repo, same "consume koboi" pattern.
 
 ---

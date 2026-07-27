@@ -1,4 +1,4 @@
-// Range <-> Cloudflare Sandbox SDK glue + koboi-agent 0.19.1 suspend/resume wiring.
+// Range <-> Cloudflare Sandbox SDK glue + koboi-agent 0.19.2 suspend/resume wiring.
 //
 // ROOT-CAUSE FIX (2026-07-24): DO.fetch(req) is SDK RPC, NOT HTTP-to-container -- using it for
 // /healthz hung the ride. The control plane now stays ENTIRELY on SDK RPC, which is guaranteed
@@ -9,7 +9,7 @@
 // Live-token streaming (data plane): proxyToSandbox + exposePort(8000) -> stable per-session preview URL (Wave-1).
 //
 // Verified against @cloudflare/sandbox@0.12.4: getSandbox, createBackup, restoreBackup,
-// startProcess->Process.waitForPort, exec. koboi 0.19.1: POST /v1/sessions/{id}/suspend ->
+// startProcess->Process.waitForPort, exec. koboi 0.19.2: POST /v1/sessions/{id}/suspend ->
 // {snapshot_path:`{db}.{sid}.suspend.db`, snapshot_bytes, checkpoint}; consistent_backup is
 // atomicity-independent. koboi serve opens shared_db EAGERLY at boot, so the resume swap MUST
 // happen before koboi serve starts -> keep-alive Mount + Outrider-owned serve lifecycle.
@@ -182,7 +182,7 @@ export interface KoboiJobSubmit {
   max_iterations?: number;
 }
 
-/** koboi job lifecycle states (koboi 0.19.1 GET /v1/jobs/{id}). The const array is the single source
+/** koboi job lifecycle states (koboi 0.19.2 GET /v1/jobs/{id}). The const array is the single source
  *  of truth: the type is derived from it, and callers build a runtime Set to validate wire bodies
  *  (the `as JobStatusResponse` cast is compile-time only). */
 export const KOBOI_JOB_STATUSES = [
@@ -215,7 +215,7 @@ export interface JobStatusResponse {
 }
 
 /** Submit an async chat job (POST /v1/jobs) that CONTINUES session `koboiSid` -- the key to
- *  conversation continuity across suspend/resume. On koboi 0.19.1 a plain job also materializes the
+ *  conversation continuity across suspend/resume. On koboi 0.19.2 a plain job also materializes the
  *  pooled agent at submit, after which GET /v1/sessions/{id} returns 200 instead of 404.
  *  Returns the job handle; the caller polls with pollChatJob(). */
 export async function submitChatJob(

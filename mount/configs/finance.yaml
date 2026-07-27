@@ -49,7 +49,7 @@ sandbox:
 
 server:
   auth_required: false   # POC -- the Outrider handles edge auth/CORS in production
-  suspend_enabled: true  # opt-in POST /v1/sessions/{id}/suspend (koboi 0.19.1) -- the Outrider calls it on dismount
+  suspend_enabled: true  # opt-in POST /v1/sessions/{id}/suspend (koboi 0.19.2) -- the Outrider calls it on dismount
   allowed_modes: [chat, act]
   cors:
     allow_origins: ["*"]   # the Outrider fronts this; tighten in production
