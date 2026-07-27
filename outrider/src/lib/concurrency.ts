@@ -4,6 +4,19 @@
 // in-flight set tracking all active sessions. Global cap leaves headroom under the
 // ~750-CPU account ceiling; per-repo cap of 1 preserves edison's project-slot /
 // same-branch protection (two jobs on the same repo must not run concurrently).
+//
+// Wiring (deploy): the class IS exported from src/index.ts. Add to your wrangler.jsonc:
+//     "durable_objects": { "bindings": [
+//         { "class_name": "Sandbox", "name": "Sandbox" },
+//         { "class_name": "ConcurrencyGateDO", "name": "CONCURRENCY_GATE" }   // <- add
+//     ] },
+//     "migrations": [
+//         { "new_sqlite_classes": ["Sandbox"], "tag": "v1" },
+//         { "new_sqlite_classes": ["ConcurrencyGateDO"], "tag": "v2" }         // <- add
+//     ]
+// (This repo keeps wrangler.jsonc deploy-values local via sparse-checkout/skip-worktree, so
+//  the binding is a documented deploy step rather than a committed line. ride() reserves via
+//  env.CONCURRENCY_GATE; retire() releases. Global cap is env-tunable: CONCURRENCY_GATE_MAX_GLOBAL.)
 
 export interface ConcurrencyGate {
   reserve(sid: string, opts: { repo?: string; squad?: string }): Promise<{ ok: boolean; reason?: string }>;
