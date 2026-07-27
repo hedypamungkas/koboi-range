@@ -15,6 +15,7 @@
 // happen before koboi serve starts -> keep-alive Mount + Outrider-owned serve lifecycle.
 import { getSandbox } from "@cloudflare/sandbox";
 import type { Sandbox, DirectoryBackup, BackupOptions, Process } from "@cloudflare/sandbox";
+import type { DurableObjectNamespace, Queue } from "@cloudflare/workers-types";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
@@ -30,17 +31,63 @@ export interface Env {
   OPENAI_API_KEY: string;
   OPENAI_BASE_URL: string;
   OPENAI_MODEL: string;
+  // Terminal webhook (optional). If set, fire HMAC-signed POST on terminal job status.
+  TERMINAL_CALLBACK_URL?: string;
+  WEBHOOK_SECRET?: string;
+  // Concurrency gate Durable Object (optional).
+  CONCURRENCY_GATE?: DurableObjectNamespace;
+  // Queue producer for dispatch backpressure (optional).
+  JOB_QUEUE?: Queue<any>;
 }
 
 export const SADDLEBAG_DIR = "/workspace";
 const SADDLEBAG_TTL_SEC = 7 * 24 * 3600;
 const MOUNT_PORT = 8000;
 const MOUNT_DB = "/workspace/koboi_memory.db";
-const mountConfig = (env: Env) => env.MOUNT_CONFIG || "/app/config/finance.yaml";
+
+/** Per-session ride options for repo materialization and config/secrets overrides. */
+export interface RideOpts {
+  /** Optional: override the global MOUNT_CONFIG per-session. */
+  mountConfig?: string;
+  /** Optional: clone this repo URL BEFORE koboi serve boots (koboi POST /v1/jobs takes NO repo param). */
+  repoUrl?: string;
+  /** Optional: checkout this base SHA after clone (git checkout <baseSha>). */
+  baseSha?: string;
+  /** Optional: select per-session/per-account secret bundle from the CF Secret Store. */
+  secretSet?: string;
+}
+
+const mountConfig = (env: Env, opts?: RideOpts) => opts?.mountConfig ?? env.MOUNT_CONFIG ?? "/app/config/finance.yaml";
+
+/** Resolve the right env-prefix for a per-session secret set. Falls back to the global OPENAI_* when unset. */
+function secretEnv(env: Env, opts?: RideOpts): string {
+  if (opts?.secretSet) {
+    // Per-session/per-account secrets: read from env key prefixed by the secret set id.
+    // e.g., secretSet="account-1" -> env.ACCOUNT_1_OPENAI_API_KEY, env.ACCOUNT_1_OPENAI_MODEL, etc.
+    const prefix = opts.secretSet.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+    const apiKey = (env as never)[`${prefix}_OPENAI_API_KEY`] as string | undefined;
+    const baseUrl = (env as never)[`${prefix}_OPENAI_BASE_URL`] as string | undefined;
+    const model = (env as never)[`${prefix}_OPENAI_MODEL`] as string | undefined;
+    if (apiKey) {
+      return [
+        `OPENAI_API_KEY='${apiKey}'`,
+        `OPENAI_BASE_URL='${baseUrl ?? ""}'`,
+        `OPENAI_MODEL='${model ?? ""}'`,
+      ].join(" ");
+    }
+    // Fall back to global if the per-session set doesn't have the required keys.
+  }
+  // Global fallback (original behavior).
+  return [
+    `OPENAI_API_KEY='${env.OPENAI_API_KEY ?? ""}'`,
+    `OPENAI_BASE_URL='${env.OPENAI_BASE_URL ?? ""}'`,
+    `OPENAI_MODEL='${env.OPENAI_MODEL ?? ""}'`,
+  ].join(" ");
+}
 
 /** A Mount = the per-session Sandbox/container, named by session id. */
-export function mount(env: Env, sessionId: string): Sandbox {
-  return getSandbox(env.Sandbox, sessionId);
+export function mount(env: Env, sessionId: string): any {
+  return getSandbox(env.Sandbox as never, sessionId);
 }
 
 /** Stable preview-URL token for `sid`. The SDK requires `[a-z0-9_]{1,16}`; raw session ids violate
@@ -118,19 +165,15 @@ async function httpInMount(
   }
 }
 
-async function startServe(sb: Sandbox, env: Env): Promise<Process> {
+async function startServe(sb: Sandbox, env: Env, opts?: RideOpts): Promise<Process> {
   // Inject the LLM secrets into the koboi serve process env. Worker secrets (`wrangler secret put`)
   // do not auto-propagate to the container in this Sandbox-SDK setup; prefixing the shell command sets
   // them for the koboi process. Single-quoted -- API keys / base_urls are [A-Za-z0-9._:/-], safe.
-  const llmEnv = [
-    `OPENAI_API_KEY='${env.OPENAI_API_KEY ?? ""}'`,
-    `OPENAI_BASE_URL='${env.OPENAI_BASE_URL ?? ""}'`,
-    `OPENAI_MODEL='${env.OPENAI_MODEL ?? ""}'`,
-  ].join(" ");
+  const llmEnv = secretEnv(env, opts);
   // --host 0.0.0.0 is REQUIRED: koboi serve defaults to 127.0.0.1, which httpInMount/waitReady reach
   // via localhost, but the SDK's preview-forward (proxyToSandbox) connects via the container's network
   // IP (e.g. 10.0.0.1:8000) -- localhost-only bind => "container is not listening in TCP address".
-  return sb.startProcess(`${llmEnv} koboi serve ${mountConfig(env)} --host 0.0.0.0 --port ${MOUNT_PORT}`);
+  return sb.startProcess(`${llmEnv} koboi serve ${mountConfig(env, opts)} --host 0.0.0.0 --port ${MOUNT_PORT}`);
 }
 
 /** Wait for koboi serve's /healthz via the SDK's internal port check (not Worker HTTP). */
@@ -153,15 +196,40 @@ async function swapSnapshot(sb: Sandbox): Promise<void> {
   );
 }
 
-/** RIDE: boot the Mount (keep-alive), restore+swap a prior Saddlebag if present, start koboi
- *  serve, wait for readiness. (First ride: no saddlebag -> fresh DB, no swap.) */
-export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null): Promise<string> {
+/** RIDE: boot the Mount (keep-alive), restore+swap a prior Saddlebag if present, materialize repo if provided,
+ *  start koboi serve, wait for readiness. (First ride: no saddlebag -> fresh DB, no swap.) */
+export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null, opts?: RideOpts): Promise<string> {
+  // Reserve concurrency slot (fail-closed: if {ok:false}, throw with reason)
+  if (env.CONCURRENCY_GATE) {
+    const gateId = env.CONCURRENCY_GATE.idFromName("gate");
+    const gate = env.CONCURRENCY_GATE.get(gateId);
+    const reserveRes = await gate.fetch(new Request("https://gate/reserve", {
+      method: "POST",
+      body: JSON.stringify({ sid: sessionId, repo: opts?.repoUrl, squad: opts?.secretSet }),
+    }));
+    const reserveData = await reserveRes.json() as { ok: boolean; reason?: string };
+    if (!reserveData.ok) {
+      const status = reserveData.reason === "global_cap_exceeded" ? 429 : 409;
+      const error = new Error(reserveData.reason ?? "concurrency_gate_rejected") as any;
+      error.status = status;
+      throw error;
+    }
+  }
+
   const sb = mount(env, sessionId);
   if (saddlebag) {
     await sb.restoreBackup(saddlebag);
     await swapSnapshot(sb);
   }
-  await waitReady(await startServe(sb, env));
+  // Per-session repo materialization: clone and checkout BEFORE koboi serve boots.
+  // koboi POST /v1/jobs takes NO repo param, so the Mount must acquire the repo first.
+  if (opts?.repoUrl) {
+    await sb.gitCheckout(opts.repoUrl);
+    if (opts.baseSha) {
+      await sb.exec(`git checkout ${opts.baseSha}`, { timeout: 60000 });
+    }
+  }
+  await waitReady(await startServe(sb, env, opts));
   return exposeStream(sb, env, sessionId); // (re)activate the streaming preview URL for this runtime
 }
 
@@ -278,12 +346,12 @@ export async function dismount(env: Env, sessionId: string, koboiSid: string): P
 }
 
 /** REMOUNT: stop any lingering serve -> restore Saddlebag -> swap -> start serve -> ready. */
-export async function remount(env: Env, sessionId: string, saddlebag: DirectoryBackup): Promise<string> {
+export async function remount(env: Env, sessionId: string, saddlebag: DirectoryBackup, opts?: RideOpts): Promise<string> {
   const sb = mount(env, sessionId);
   await stopServe(sb);
   await sb.restoreBackup(saddlebag);
   await swapSnapshot(sb);
-  await waitReady(await startServe(sb, env));
+  await waitReady(await startServe(sb, env, opts));
   return exposeStream(sb, env, sessionId); // re-activate the SAME preview URL for the fresh runtime
 }
 
@@ -297,6 +365,21 @@ export async function sessionMessages(env: Env, _sessionId: string, koboiSid: st
  *  -- the SDK does not contact/wake/probe the container for it, so it's safe even if the port was
  *  never exposed or the container is already gone. */
 export async function retire(env: Env, sessionId: string, saddlebag?: DirectoryBackup | null) {
+  // Release the concurrency slot
+  if (env.CONCURRENCY_GATE) {
+    const gateId = env.CONCURRENCY_GATE.idFromName("gate");
+    const gate = env.CONCURRENCY_GATE.get(gateId);
+    try {
+      await gate.fetch(new Request("https://gate/release", {
+        method: "POST",
+        body: JSON.stringify({ sid: sessionId }),
+      }));
+    } catch (err) {
+      console.error("concurrency gate release failed", sessionId, String(err));
+      // Don't fail retire if release fails -- the slot will eventually TTL
+    }
+  }
+
   const sb = mount(env, sessionId);
   try {
     await sb.unexposePort(MOUNT_PORT); // revoke the streaming preview URL (best-effort, idempotent)
@@ -324,8 +407,60 @@ export async function runReconcile(
   sid: string,
   message = "Reconcile invoice INV-8842 against PO-4471 using the ERP tools "
     + "(fetch_invoice, fetch_purchase_order, three_way_match) and report the result.",
+  opts?: RideOpts,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const safe = message.replace(/'/g, `'\\''`); // single-quote-escape for the shell -m arg
-  const r = await mount(env, sid).exec(`koboi run ${mountConfig(env)} -m '${safe}'`, { timeout: 180000 });
+  const r = await mount(env, sid).exec(`koboi run ${mountConfig(env, opts)} -m '${safe}'`, { timeout: 180000 });
   return { exitCode: r.exitCode, stdout: r.stdout || "", stderr: (r.stderr || "").slice(0, 1000) };
+}
+
+/** DIFF: run `git diff <base>` inside the Mount and return the patch text. Captures every change
+ *  since the checkout base (committed by the agent or not). No base -> `git diff HEAD` (uncommitted
+ *  working-tree changes only). `baseSha` is charset-sanitized to [A-Za-z0-9_./-] (a valid git ref
+ *  charset) so no shell metacharacter can survive -- the edison koboi mode consumes this to bring the
+ *  agent's edits back into its local clone. */
+export async function diffWorkspace(env: Env, sid: string, baseSha?: string): Promise<{ patch: string; exitCode: number }> {
+  const ref = baseSha ? String(baseSha).replace(/[^A-Za-z0-9_.\/-]/g, "") : null;
+  const cmd = ref ? `git diff ${ref}` : `git diff HEAD`;
+  const r = await mount(env, sid).exec(cmd, { timeout: 30_000 });
+  return { patch: (r.stdout || "").trim(), exitCode: r.exitCode ?? 0 };
+}
+
+/** Compute HMAC-SHA256 signature using Web Crypto (SubtleCrypto). Returns hex-encoded signature. */
+export async function hmacSha256(secret: string, message: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret);
+  const messageData = encoder.encode(message);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign("HMAC", cryptoKey, messageData);
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** Queue job payload for dispatch backpressure. */
+export interface QueueJobPayload {
+  sid: string;
+  message?: string;
+  repoUrl?: string;
+  baseSha?: string;
+  secretSet?: string;
+  mode?: string;
+  max_iterations?: number;
+}
+
+/** Enqueue a koboi job to the queue (dispatch backpressure seam). */
+export async function enqueueJob(env: Env, payload: QueueJobPayload): Promise<void> {
+  if (!env.JOB_QUEUE) {
+    throw new Error("JOB_QUEUE not bound");
+  }
+  await env.JOB_QUEUE.send(payload);
 }

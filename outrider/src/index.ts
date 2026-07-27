@@ -15,11 +15,14 @@
 // Live-token STREAMING (data plane): proxyToSandbox proxies <port>-<sid>-<token>.<domain> -> Mount;
 //   exposePort(8000) (re)mints the per-session preview URL on each ride/remount (Wave-1, wired).
 
-import type { Env } from "./lib/sandbox";
+import type { Env, RideOpts, QueueJobPayload } from "./lib/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
+// ConcurrencyGateDO must be exported from the entry (main) for the wrangler durable_objects
+// binding (CONCURRENCY_GATE) to resolve at deploy. ride() reserves a slot; retire() releases it.
+export { ConcurrencyGateDO } from "./lib/concurrency";
 import { proxyToSandbox } from "@cloudflare/sandbox";
 
-import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, KOBOI_JOB_STATUSES } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, diffWorkspace, KOBOI_JOB_STATUSES, hmacSha256 } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
 const IDLE_THRESHOLD_MS = 60_000;
@@ -33,7 +36,7 @@ export default {
     if (url.pathname === "/healthz") return json({ service: "koboi-range-outrider", status: "ok" });
 
     const m = url.pathname.match(
-      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages|ping|reconcile|chat)\/([^/]+)(?:\/([^/]+))?$/,
+      /^\/lifecycle\/(ride|session|dismount|remount|retire|status|observe|messages|ping|reconcile|chat|diff)\/([^/]+)(?:\/([^/]+))?$/,
     );
     if (m) return handleLifecycle(m[1], decodeURIComponent(m[2]), req, env, m[3] ? decodeURIComponent(m[3]) : undefined);
 
@@ -41,7 +44,7 @@ export default {
     // are proxied straight to the per-session Mount's `koboi serve` by proxyToSandbox -- its body is
     // streamed unbuffered (TransformStream passthrough), so SSE /v1/chat/stream flows token-by-token.
     // Returns null for non-preview hostnames -> fall through to the 501 hint below.
-    const proxy = await proxyToSandbox(req, env);
+    const proxy = await proxyToSandbox(req, env as any);
     if (proxy) return proxy;
 
     // Bare-hostname hit on /chat/stream or /v1/* (no preview URL) -> point the client at the
@@ -80,6 +83,50 @@ export default {
       })(),
     );
   },
+
+  async queue(batch: MessageBatch<QueueJobPayload>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const payload = message.body;
+      try {
+        // Enqueue a ride + chat job for this session
+        const existing = await reg.get(env, payload.sid);
+        let streamUrl: string | undefined;
+        if (existing?.status !== "riding") {
+          streamUrl = await ride(env, payload.sid, existing?.saddlebag ?? null, {
+            repoUrl: payload.repoUrl,
+            baseSha: payload.baseSha,
+            secretSet: payload.secretSet,
+          });
+        }
+        let koboiSid = existing?.koboiSessionId ?? null;
+        if (!koboiSid) koboiSid = await createSession(env, payload.sid);
+        await reg.setStatus(env, payload.sid, "riding", {
+          koboiSessionId: koboiSid,
+          lastError: null,
+          ...(streamUrl ? { streamUrl } : {}),
+        });
+
+        // If message payload includes a chat prompt, submit the job
+        if (payload.message) {
+          const job = await submitChatJob(env, payload.sid, koboiSid, {
+            message: payload.message,
+            mode: payload.mode,
+            max_iterations: payload.max_iterations,
+          });
+          console.log("queue: submitted job", payload.sid, job.job_id, job.status);
+        } else {
+          console.log("queue: rode session", payload.sid);
+        }
+
+        // Ack the message (retry only on failure)
+        message.ack();
+      } catch (err) {
+        console.error("queue job failed", payload.sid, String(err));
+        // Don't ack -- retry with backoff
+        message.retry();
+      }
+    }
+  },
 };
 
 async function handleLifecycle(action: string, sid: string, req: Request, env: Env, jobId?: string): Promise<Response> {
@@ -93,12 +140,15 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     }
     case "ride": {
       const existing = await reg.get(env, sid);
-      const streamUrl = await ride(env, sid, existing?.saddlebag ?? null);
+      const body = (await req.json().catch(() => ({}))) as RideOpts;
+      const streamUrl = await ride(env, sid, existing?.saddlebag ?? null, body);
       await reg.setStatus(env, sid, "riding", { saddlebag: existing?.saddlebag ?? null, streamUrl });
       return json({ sid, action: "ride", status: "riding", streamUrl });
     }
     case "session": {
-      const streamUrl = await ride(env, sid, (await reg.get(env, sid))?.saddlebag ?? null); // ensure Mount is up
+      const body = (await req.json().catch(() => ({}))) as RideOpts;
+      const existing = await reg.get(env, sid);
+      const streamUrl = await ride(env, sid, existing?.saddlebag ?? null, body); // ensure Mount is up
       const koboiSid = await createSession(env, sid);
       await reg.setStatus(env, sid, "riding", { koboiSessionId: koboiSid, streamUrl });
       return json({ sid, action: "session", koboiSessionId: koboiSid, status: "riding", streamUrl });
@@ -132,6 +182,38 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
             lastError: `chat ${jobId}: unexpected koboi status ${JSON.stringify(st)}`,
           });
         }
+
+        // Fire terminal webhook (idempotent): only on first terminal transition, only once per job.
+        const TERMINAL_STATUSES = new Set(["completed", "failed", "timed_out", "cancelled"] as const);
+        if (TERMINAL_STATUSES.has(st as any) && !rec?.terminalNotified) {
+          const cbUrl = env.TERMINAL_CALLBACK_URL;
+          const secret = env.WEBHOOK_SECRET;
+          if (cbUrl && secret) {
+            try {
+              const body = JSON.stringify({
+                sid,
+                job_id: jobId,
+                status: st,
+                error: out.body.error,
+                ts: Date.now(),
+              });
+              const sig = await hmacSha256(secret, body);
+              await fetch(cbUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Range-Signature": `sha256=${sig}`,
+                },
+                body,
+              });
+              await reg.setStatus(env, sid, "riding", { terminalNotified: true });
+            } catch (err) {
+              console.error("terminal webhook failed", sid, jobId, String(err));
+              // Don't mark terminalNotified on failure -- retry on next poll
+            }
+          }
+        }
+
         return json({ sid, action: "chat", job: out.body });
       }
       if (req.method !== "POST") {
@@ -183,7 +265,8 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     case "remount": {
       const rec = await reg.get(env, sid);
       if (!rec?.saddlebag) return json({ error: "no saddlebag to remount" }, 400);
-      const streamUrl = await remount(env, sid, rec.saddlebag);
+      const body = (await req.json().catch(() => ({}))) as RideOpts;
+      const streamUrl = await remount(env, sid, rec.saddlebag, body);
       await reg.setStatus(env, sid, "riding", { streamUrl });
       return json({ sid, action: "remount", status: "riding", streamUrl });
     }
@@ -200,6 +283,16 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     }
     case "status": {
       return json(await reg.get(env, sid));
+    }
+    case "diff": {
+      // GET /lifecycle/diff/<sid>?base=<sha> -> run `git diff <base>` inside the Mount and return the
+      // patch. The edison koboi mode calls this to bring the agent's edits back into its local clone
+      // (so edison's own commit + Bitbucket-PR pipeline runs unchanged). Requires the Mount riding.
+      const rec = await reg.get(env, sid);
+      if (rec?.status !== "riding") return json({ error: "session_not_riding", status: rec?.status ?? "unknown" }, 503);
+      const base = new URL(req.url).searchParams.get("base") ?? undefined;
+      const out = await diffWorkspace(env, sid, base);
+      return json({ sid, action: "diff", patch: out.patch, exitCode: out.exitCode, base: base ?? null });
     }
     case "observe": {
       const body = (await req.json().catch(() => ({}))) as { status?: string };
