@@ -42,11 +42,25 @@
     "BACKUP_BUCKET_NAME": "range-saddlebags",
     "CLOUDFLARE_ACCOUNT_ID": "<YOUR_ACCOUNT_ID>",
     "MOUNT_CONFIG": "/app/config/finance.yaml",
-    // PUBLIC_DOMAIN = the Worker's public hostname (custom domain). exposePort() mints the live-token
-    // streaming preview URL under it. Required before deploying Wave-1; pair with wildcard DNS
-    // *.range.<yourdomain> -> this Worker so <port>-<sid>-<token>.range.<yourdomain> resolves.
-    "PUBLIC_DOMAIN": "<YOUR_PUBLIC_DOMAIN e.g. range.yourdomain.com>"
+    // PUBLIC_DOMAIN = the Worker's public hostname. exposePort() mints the live-token streaming preview
+    // URL under it as <port>-<sid>-<token>.<PUBLIC_DOMAIN>. It MUST be a DEDICATED zone apex you control
+    // solely for this Worker -- a root domain you own (e.g. "koboi-range.dev"), NOT a subdomain of a
+    // shared zone. Why: the streaming route below is a wildcard that claims the WHOLE zone, so putting it
+    // on a SHARED zone's apex (e.g. *.lab-sandbox.dev) shadows every other project on that zone (real
+    // incident: *.lab-sandbox.dev/* made an unrelated sibling worker's /healthz answer as the Outrider).
+    // A dedicated root domain keeps preview URLs at ONE level (*.your-domain) -> covered by free Universal
+    // SSL; a deeper subdomain (*.range.your-domain) needs Advanced Certificate Manager or a self-uploaded
+    // Let's Encrypt wildcard, and delegating one as its own "subdomain zone" is Enterprise-only on CF.
+    "PUBLIC_DOMAIN": "<YOUR_DEDICATED_ROOT_DOMAIN e.g. koboi-range.dev>"
   },
+
+  // Wave-1 streaming route (uncomment + fill in <PUBLIC_DOMAIN> at deploy time). The pattern's zone MUST
+  // match PUBLIC_DOMAIN. Deploy steps: add the zone to Cloudflare; add a proxied wildcard DNS record
+  //   `A  *  192.0.2.0  Proxied`   (RFC 5737 doc address -- the Worker intercepts before any origin
+  //   connect, so the IP never matters); wait for Universal SSL on *.<PUBLIC_DOMAIN>; `wrangler deploy`.
+  // "routes": [
+  //   { "pattern": "*.<YOUR_DEDICATED_ROOT_DOMAIN>/*", "zone_name": "<YOUR_DEDICATED_ROOT_DOMAIN>" }
+  // ],
 
   // The Range heartbeat -- 1/min, same cadence as the Devin Outposts template.
   "triggers": {

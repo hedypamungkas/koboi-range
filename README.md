@@ -218,9 +218,16 @@ for the Wave-0 → Wave-1b TODO list.
   proxies `<port>-<sid>-<token>.<PUBLIC_DOMAIN>` subdomains straight to the per-session Mount's
   `koboi serve` (unbuffered body → SSE `/v1/chat/stream` flows token-by-token); `exposePort(8000,
   {hostname, token})` is re-activated on every `ride`/`remount` so the preview URL is **stable and
-  survives suspend/resume**. Requires `PUBLIC_DOMAIN` + wildcard DNS `*.range.<domain>` (a deploy
-  step); live token-by-token delivery still wants a `curl -N` smoke check. Quick tunnels
-  (`*.trycloudflare.com`) are unsuitable: they buffer SSE and the URL churns every remount.
+  survives suspend/resume**. Requires `PUBLIC_DOMAIN` + wildcard DNS `*.<PUBLIC_DOMAIN>` → the
+  Worker (a deploy step). **`PUBLIC_DOMAIN` must be a dedicated zone apex you own (e.g.
+  `koboi-range.dev`), never a shared zone's apex** — the streaming wildcard route claims the whole
+  zone, so `*.<shared-zone>/*` shadows every sibling project on it (we hit this: a
+  `*.lab-sandbox.dev/*` route made an unrelated sibling worker's `/healthz` answer as the Outrider).
+  A dedicated root domain also keeps preview URLs one level deep, covered by free Universal SSL;
+  deeper subdomains need Advanced Certificate Manager or a self-uploaded Let's Encrypt wildcard,
+  and delegating one as its own zone is Enterprise-only. Live token-by-token delivery still wants a
+  `curl -N` smoke check. Quick tunnels (`*.trycloudflare.com`) are unsuitable: they buffer SSE and
+  the URL churns every remount.
 - **`pending_approval` observation is via a webhook receiver** (`/lifecycle/observe/:sid`).
   Wire the Mount's `jobs.webhooks` / `handover.webhooks` to POST there. (Polling the Mount's job
   status from the cron is the alternative.)
