@@ -46,6 +46,19 @@ describe("ConcurrencyGate DO", () => {
     expect(r3.ok).toBe(true);
   });
 
+  it("per-repo cap: env CONCURRENCY_GATE_MAX_PER_REPO overrides the default (relax for isolated workspaces)", async () => {
+    const do1 = new ConcurrencyGateDO(doStub, { CONCURRENCY_GATE_MAX_PER_REPO: "2" });
+
+    const r1 = await do1.reserve("sid1", { repo: "repo-a" });
+    const r2 = await do1.reserve("sid2", { repo: "repo-a" });
+    const r3 = await do1.reserve("sid3", { repo: "repo-a" });
+
+    expect(r1.ok).toBe(true);
+    expect(r2.ok).toBe(true); // 2nd allowed under cap=2
+    expect(r3.ok).toBe(false); // 3rd blocked
+    expect(r3.reason).toBe("repo_slot_held");
+  });
+
   it("release: frees the slot for reuse", async () => {
     const do1 = new ConcurrencyGateDO(doStub, { CONCURRENCY_GATE_MAX_GLOBAL: "1" });
 

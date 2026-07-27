@@ -16,7 +16,8 @@
 //     ]
 // (This repo keeps wrangler.jsonc deploy-values local via sparse-checkout/skip-worktree, so
 //  the binding is a documented deploy step rather than a committed line. ride() reserves via
-//  env.CONCURRENCY_GATE; retire() releases. Global cap is env-tunable: CONCURRENCY_GATE_MAX_GLOBAL.)
+//  env.CONCURRENCY_GATE; retire() releases. Caps are env-tunable: CONCURRENCY_GATE_MAX_GLOBAL
+//  (default 50) and CONCURRENCY_GATE_MAX_PER_REPO (default 1 -- raise only with per-job isolation).)
 
 export interface ConcurrencyGate {
   reserve(sid: string, opts: { repo?: string; squad?: string }): Promise<{ ok: boolean; reason?: string }>;
@@ -25,6 +26,9 @@ export interface ConcurrencyGate {
 
 export interface ConcurrencyGateEnv {
   CONCURRENCY_GATE_MAX_GLOBAL?: string;
+  /** Per-repo concurrency cap. Default 1 (preserves edison's project-slot / same-branch protection).
+   *  Raise ONLY if the host supports per-job isolated workspaces (else two jobs clobber one clone). */
+  CONCURRENCY_GATE_MAX_PER_REPO?: string;
 }
 
 interface InFlightEntry {
@@ -41,12 +45,14 @@ export class ConcurrencyGateDO implements DurableObject {
   // Default global cap: 50 (leaves headroom under ~750 CPU account ceiling)
   // Configurable via env.CONCURRENCY_GATE_MAX_GLOBAL env var.
   private MAX_GLOBAL: number;
-  // Per-repo cap: 1 (preserves edison's project-slot / same-branch protection)
-  private readonly MAX_PER_REPO = 1;
+  // Per-repo cap: default 1 (preserves edison's project-slot / same-branch protection).
+  // Configurable via env.CONCURRENCY_GATE_MAX_PER_REPO -- raise only with per-job workspace isolation.
+  private MAX_PER_REPO: number;
 
   constructor(state: DurableObjectState, env: ConcurrencyGateEnv) {
     this.state = state;
     this.MAX_GLOBAL = env.CONCURRENCY_GATE_MAX_GLOBAL ? parseInt(env.CONCURRENCY_GATE_MAX_GLOBAL, 10) : 50;
+    this.MAX_PER_REPO = env.CONCURRENCY_GATE_MAX_PER_REPO ? parseInt(env.CONCURRENCY_GATE_MAX_PER_REPO, 10) : 1;
   }
 
   async reserve(sid: string, opts: { repo?: string; squad?: string }): Promise<{ ok: boolean; reason?: string }> {
