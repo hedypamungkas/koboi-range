@@ -5,7 +5,7 @@ import { ride, dismount, remount, retire } from "../src/lib/sandbox";
 import { sandboxSpy } from "./_sdk-mock";
 
 // Lifecycle fns only touch env.MOUNT_CONFIG (env.Sandbox is consumed by the mocked getSandbox).
-const env = { MOUNT_CONFIG: "/app/config/finance.yaml", PUBLIC_DOMAIN: "range.example.com" } as never;
+const env = { MOUNT_CONFIG: "/app/config/default.yaml", PUBLIC_DOMAIN: "range.example.com" } as never;
 
 const saddlebag = { id: "bk-1", name: "s1", dir: "/workspace" } as never;
 

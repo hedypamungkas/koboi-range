@@ -22,12 +22,15 @@ export { Sandbox } from "@cloudflare/sandbox";
 export { ConcurrencyGateDO } from "./lib/concurrency";
 import { proxyToSandbox } from "@cloudflare/sandbox";
 
-import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, diffWorkspace, KOBOI_JOB_STATUSES, hmacSha256 } from "./lib/sandbox";
+import { ride, createSession, dismount, remount, retire, sessionMessages, pingMount, runReconcile, submitChatJob, pollChatJob, diffWorkspace, releaseConcurrencySlot, KOBOI_JOB_STATUSES, hmacSha256 } from "./lib/sandbox";
 import * as reg from "./lib/registry";
 
 const IDLE_THRESHOLD_MS = 60_000;
 /** Runtime mirror of KoboiJobStatus for validating poll bodies (the TS cast is not a runtime check). */
 const KOBOI_JOB_STATUS_SET: ReadonlySet<string> = new Set(KOBOI_JOB_STATUSES);
+/** Job statuses that mark a chat job terminal (no further polling). Hoisted to module scope (subset
+ *  of KOBOI_JOB_STATUSES) so it is not reallocated on every poll. */
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "timed_out", "cancelled"]);
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -121,7 +124,11 @@ export default {
         // Ack the message (retry only on failure)
         message.ack();
       } catch (err) {
-        console.error("queue job failed", payload.sid, String(err));
+        console.error("queue job failed", payload.sid, err);
+        // Release any slot this attempt reserved (ride() reserves before booting). Idempotent, so
+        // safe even if ride() already released on its own failure. Prevents a leak across retries
+        // and avoids a per-repo self-deadlock when the same sid is re-reserved on redelivery.
+        try { await releaseConcurrencySlot(env, payload.sid); } catch { /* best-effort */ }
         // Don't ack -- retry with backoff
         message.retry();
       }
@@ -183,11 +190,17 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
           });
         }
 
-        // Fire terminal webhook (idempotent): only on first terminal transition, only once per job.
-        const TERMINAL_STATUSES = new Set(["completed", "failed", "timed_out", "cancelled"] as const);
-        if (TERMINAL_STATUSES.has(st as any) && !rec?.terminalNotified) {
+        // Fire terminal webhook, idempotent PER JOB (not per session): a keep-alive Mount runs many
+        // jobs, so each terminal transition must fire independently -- a per-session flag would silently
+        // swallow every job after the first.
+        const alreadyNotified = rec?.notifiedJobIds?.includes(jobId) ?? false;
+        if (TERMINAL_STATUSES.has(st) && !alreadyNotified) {
           const cbUrl = env.TERMINAL_CALLBACK_URL;
           const secret = env.WEBHOOK_SECRET;
+          if ((cbUrl || secret) && !(cbUrl && secret)) {
+            // Partial config: surface the misconfiguration instead of silently no-op'ing forever.
+            console.error("terminal webhook misconfigured: set BOTH TERMINAL_CALLBACK_URL and WEBHOOK_SECRET", sid, jobId, "cbUrl:", !!cbUrl, "secret:", !!secret);
+          }
           if (cbUrl && secret) {
             try {
               const body = JSON.stringify({
@@ -198,7 +211,7 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
                 ts: Date.now(),
               });
               const sig = await hmacSha256(secret, body);
-              await fetch(cbUrl, {
+              const res = await fetch(cbUrl, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
@@ -206,10 +219,15 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
                 },
                 body,
               });
-              await reg.setStatus(env, sid, "riding", { terminalNotified: true });
+              // fetch() resolves on ANY HTTP status (incl. 5xx) -- treat non-2xx as failure so the
+              // next poll retries instead of permanently recording this job as notified.
+              if (!res.ok) throw new Error(`terminal webhook non-2xx: ${res.status}`);
+              const notified = new Set(rec?.notifiedJobIds ?? []);
+              notified.add(jobId);
+              await reg.setStatus(env, sid, "riding", { notifiedJobIds: [...notified] });
             } catch (err) {
               console.error("terminal webhook failed", sid, jobId, String(err));
-              // Don't mark terminalNotified on failure -- retry on next poll
+              // Don't record jobId as notified -- retry on next poll.
             }
           }
         }
@@ -286,8 +304,8 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
     }
     case "diff": {
       // GET /lifecycle/diff/<sid>?base=<sha> -> run `git diff <base>` inside the Mount and return the
-      // patch. The edison koboi mode calls this to bring the agent's edits back into its local clone
-      // (so edison's own commit + Bitbucket-PR pipeline runs unchanged). Requires the Mount riding.
+      // patch. The orchestrating caller fetches this to pull the agent's edits back into its own clone
+      // (so the caller's own commit + PR pipeline runs unchanged). Requires the Mount riding.
       const rec = await reg.get(env, sid);
       if (rec?.status !== "riding") return json({ error: "session_not_riding", status: rec?.status ?? "unknown" }, 503);
       const base = new URL(req.url).searchParams.get("base") ?? undefined;
@@ -305,7 +323,11 @@ async function handleLifecycle(action: string, sid: string, req: Request, env: E
   }
   return json({ error: "unknown action" }, 400);
   } catch (e) {
-    return json({ error: "lifecycle_failed", action, sid, detail: String((e as Error)?.message ?? e) }, 500);
+    // Preserve HTTP semantics thrown from deeper layers (e.g. ride()'s concurrency-gate 429/409)
+    // instead of collapsing every failure to a generic 500.
+    const thrown = e as { status?: number };
+    const status = thrown.status && Number.isFinite(thrown.status) ? thrown.status : 500;
+    return json({ error: "lifecycle_failed", action, sid, detail: String((e as Error)?.message ?? e) }, status);
   }
 }
 

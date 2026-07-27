@@ -33,7 +33,7 @@ describe("ride options", () => {
 
   it("repo materialization: gitCheckout + git checkout baseSha before koboi serve", async () => {
     const env = {
-      MOUNT_CONFIG: "/app/config/finance.yaml",
+      MOUNT_CONFIG: "/app/config/default.yaml",
       PUBLIC_DOMAIN: "example.com",
       OPENAI_API_KEY: "sk-test",
       OPENAI_BASE_URL: "",
@@ -51,7 +51,7 @@ describe("ride options", () => {
 
   it("secretSet: per-session secrets override global OPENAI_*", async () => {
     const env = {
-      MOUNT_CONFIG: "/app/config/finance.yaml",
+      MOUNT_CONFIG: "/app/config/default.yaml",
       PUBLIC_DOMAIN: "example.com",
       OPENAI_API_KEY: "sk-global",
       OPENAI_BASE_URL: "https://api.openai.com/v1",
@@ -109,7 +109,7 @@ describe("diffWorkspace", () => {
   });
 
   it("runs `git diff <base>` when a base SHA is provided", async () => {
-    const env = { MOUNT_CONFIG: "/app/config/finance.yaml", PUBLIC_DOMAIN: "example.com" } as never;
+    const env = { MOUNT_CONFIG: "/app/config/default.yaml", PUBLIC_DOMAIN: "example.com" } as never;
     sandboxSpy.exec.mockResolvedValueOnce({ stdout: "--- a/f\n+++ b/f\n", stderr: "", exitCode: 0 });
     const out = await diffWorkspace(env, "s1", "abc123");
     expect(sandboxSpy.exec).toHaveBeenCalledWith("git diff abc123", { timeout: 30_000 });
@@ -118,22 +118,18 @@ describe("diffWorkspace", () => {
   });
 
   it("runs `git diff HEAD` when no base is provided", async () => {
-    const env = { MOUNT_CONFIG: "/app/config/finance.yaml", PUBLIC_DOMAIN: "example.com" } as never;
+    const env = { MOUNT_CONFIG: "/app/config/default.yaml", PUBLIC_DOMAIN: "example.com" } as never;
     sandboxSpy.exec.mockResolvedValueOnce({ stdout: "patch-text\n", stderr: "", exitCode: 0 });
     const out = await diffWorkspace(env, "s1");
     expect(sandboxSpy.exec).toHaveBeenCalledWith("git diff HEAD", { timeout: 30_000 });
     expect(out.patch).toBe("patch-text");
   });
 
-  it("sanitizes baseSha so no shell metacharacter survives", async () => {
-    const env = { MOUNT_CONFIG: "/app/config/finance.yaml", PUBLIC_DOMAIN: "example.com" } as never;
-    sandboxSpy.exec.mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 0 });
-    await diffWorkspace(env, "s1", "abc; rm -rf /");
-    const calls = sandboxSpy.exec.mock.calls as any[][];
-    const arg = calls[0]?.[0] as string;
-    // only [A-Za-z0-9_./-] survive -> a single safe token, no ;/space/pipe/backtick
-    expect(arg).toBe("git diff abcrm-rf/");
-    expect(arg).not.toContain(";");
+  it("rejects an invalid baseSha instead of running a sanitized shell command", async () => {
+    const env = { MOUNT_CONFIG: "/app/config/default.yaml", PUBLIC_DOMAIN: "example.com" } as never;
+    await expect(diffWorkspace(env, "s1", "abc; rm -rf /")).rejects.toThrow(/invalid baseSha/);
+    // No shell command is ever issued for a bad ref.
+    expect(sandboxSpy.exec).not.toHaveBeenCalled();
   });
 });
 
@@ -152,5 +148,46 @@ describe("terminal job statuses", () => {
 
     TERMINAL.forEach((s) => expect(KOBOI_JOB_STATUSES).toContain(s as never));
     NON_TERMINAL.forEach((s) => expect(KOBOI_JOB_STATUSES).toContain(s as never));
+  });
+});
+
+describe("input validation (fail-closed)", () => {
+  beforeEach(() => {
+    sandboxSpy.exec.mockClear();
+    sandboxSpy.startProcess.mockClear();
+    sandboxSpy.exposePort.mockClear();
+    (sandboxSpy as any).gitCheckout.mockClear();
+  });
+
+  const baseEnv = () => ({
+    MOUNT_CONFIG: "/app/config/default.yaml",
+    PUBLIC_DOMAIN: "example.com",
+    OPENAI_API_KEY: "sk-global",
+    OPENAI_BASE_URL: "",
+    OPENAI_MODEL: "gpt-4",
+  }) as never;
+
+  it("ride: rejects an injection-shaped baseSha before it reaches a shell", async () => {
+    await expect(ride(baseEnv(), "s1", null, { repoUrl: "https://x/repo.git", baseSha: "main; pwn" }))
+      .rejects.toThrow(/invalid baseSha/);
+
+    // The malicious ref never reaches `git checkout ...`, and serve never booted.
+    const cmds = (sandboxSpy.exec.mock.calls as any[][]).map((c) => c[0] as string);
+    expect(cmds.some((c) => c.includes("pwn"))).toBe(false);
+    expect(sandboxSpy.startProcess).not.toHaveBeenCalled();
+  });
+
+  it("secretSet: refuses to fall back to global credentials when the set is incomplete", async () => {
+    // ACCOUNT_Z_OPENAI_API_KEY intentionally NOT set -> must throw, not silently use sk-global.
+    await expect(ride(baseEnv(), "s1", null, { secretSet: "account-z" }))
+      .rejects.toThrow(/ACCOUNT_Z_OPENAI_API_KEY is not set/);
+    expect(sandboxSpy.startProcess).not.toHaveBeenCalled();
+  });
+
+  it("secretSet: rejects an id that violates the charset (prevents prefix collision)", async () => {
+    // "account.x" contains a dot -> outside [a-z0-9-].
+    await expect(ride(baseEnv(), "s1", null, { secretSet: "account.x" }))
+      .rejects.toThrow(/invalid secretSet/);
+    expect(sandboxSpy.startProcess).not.toHaveBeenCalled();
   });
 });
