@@ -20,6 +20,7 @@ export interface SessionRecord {
   lastCheckpointOk?: boolean | null; // from the /suspend checkpoint on the last dismount
   koboiSessionId?: string | null; // the koboi session id created inside this Mount (for /suspend + verify)
   streamUrl?: string | null; // the exposePort() preview URL for live-token SSE streaming
+  notifiedJobIds?: string[]; // job ids for which the terminal webhook has already fired (per-job idempotency)
 }
 
 const PREFIX = "range:session:";

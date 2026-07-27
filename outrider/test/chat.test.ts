@@ -14,7 +14,7 @@ const e = env as unknown as Env;
 const outrider = (exports as unknown as { default: { fetch: (req: Request) => Promise<Response> } }).default;
 const call = (url: string, init?: RequestInit) => outrider.fetch(new Request(url, init));
 const json = (r: Response) => r.json();
-const envLite = { MOUNT_CONFIG: "/app/config/finance.yaml" } as never;
+const envLite = { MOUNT_CONFIG: "/app/config/default.yaml" } as never;
 
 /** Shape the mock exec result so httpInMount parses {status, body} from its last stdout line. */
 const execOut = (body: unknown, status = 200) => ({
