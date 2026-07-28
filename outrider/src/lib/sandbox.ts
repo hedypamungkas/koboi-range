@@ -31,6 +31,9 @@ export interface Env {
   OPENAI_API_KEY: string;
   OPENAI_BASE_URL: string;
   OPENAI_MODEL: string;
+  // Anthropic/DashScope credentials (optional). Forwarded to the Mount for Anthropic LLM configs.
+  ANTHROPIC_AUTH_TOKEN?: string;
+  ANTHROPIC_BASE_URL?: string;
   // Terminal webhook (optional). If set, fire HMAC-signed POST on terminal job status.
   TERMINAL_CALLBACK_URL?: string;
   WEBHOOK_SECRET?: string;
@@ -70,8 +73,11 @@ const SECRET_SET_RE = /^[a-z0-9-]{1,32}$/;
 
 /** Resolve the LLM env vars for the koboi serve process. When `secretSet` is requested, the matching
  *  `<PREFIX>_OPENAI_*` env vars MUST exist -- we refuse to silently fall back to the global credentials,
- *  since that would route a job to the wrong account (billing, data residency, model). */
+ *  since that would route a job to the wrong account (billing, data residency, model).
+ *  Anthropic credentials (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL) are forwarded when present
+ *  (global-only for now; per-secretSet Anthropic resolution is future work). */
 function secretEnv(env: Env, opts?: RideOpts): string {
+  let parts: string[];
   if (opts?.secretSet) {
     if (!SECRET_SET_RE.test(opts.secretSet)) {
       throw new Error(`invalid secretSet "${opts.secretSet}": must match ${SECRET_SET_RE}`);
@@ -87,18 +93,31 @@ function secretEnv(env: Env, opts?: RideOpts): string {
     }
     const baseUrl = (env as never)[`${prefix}_OPENAI_BASE_URL`] as string | undefined;
     const model = (env as never)[`${prefix}_OPENAI_MODEL`] as string | undefined;
-    return [
+    parts = [
       `OPENAI_API_KEY='${apiKey}'`,
       `OPENAI_BASE_URL='${baseUrl ?? ""}'`,
       `OPENAI_MODEL='${model ?? ""}'`,
-    ].join(" ");
+    ];
+  } else {
+    // Global credentials (the only path when no per-session secretSet is requested).
+    parts = [
+      `OPENAI_API_KEY='${env.OPENAI_API_KEY ?? ""}'`,
+      `OPENAI_BASE_URL='${env.OPENAI_BASE_URL ?? ""}'`,
+      `OPENAI_MODEL='${env.OPENAI_MODEL ?? ""}'`,
+    ];
   }
-  // Global credentials (the only path when no per-session secretSet is requested).
-  return [
-    `OPENAI_API_KEY='${env.OPENAI_API_KEY ?? ""}'`,
-    `OPENAI_BASE_URL='${env.OPENAI_BASE_URL ?? ""}'`,
-    `OPENAI_MODEL='${env.OPENAI_MODEL ?? ""}'`,
-  ].join(" ");
+
+  // Forward Anthropic credentials when present (global-only for now; per-secretSet resolution is future work).
+  const anthropicToken = (env as { ANTHROPIC_AUTH_TOKEN?: string }).ANTHROPIC_AUTH_TOKEN;
+  if (anthropicToken) {
+    parts.push(`ANTHROPIC_AUTH_TOKEN='${anthropicToken}'`);
+  }
+  const anthropicBaseUrl = (env as { ANTHROPIC_BASE_URL?: string }).ANTHROPIC_BASE_URL;
+  if (anthropicBaseUrl) {
+    parts.push(`ANTHROPIC_BASE_URL='${anthropicBaseUrl}'`);
+  }
+
+  return parts.join(" ");
 }
 
 /** The subset of the container API the Outrider drives. Narrowed from the SDK's `Sandbox` type
