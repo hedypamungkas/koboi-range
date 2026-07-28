@@ -69,6 +69,78 @@ describe("ride options", () => {
     expect(cmd).toContain("sk-account-x");
     expect(cmd).not.toContain("sk-global");
   });
+
+  it("forwards ANTHROPIC_AUTH_TOKEN when present", async () => {
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+      ANTHROPIC_AUTH_TOKEN: "sk-ant-test",
+    } as never;
+
+    await ride(env, "s1", null, {});
+
+    expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    const calls = sandboxSpy.startProcess.mock.calls as any[][];
+    const cmd = calls[0]?.[0] as string;
+    expect(cmd).toContain("ANTHROPIC_AUTH_TOKEN='sk-ant-test'");
+  });
+
+  it("omits ANTHROPIC_AUTH_TOKEN when absent", async () => {
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+    } as never;
+
+    await ride(env, "s1", null, {});
+
+    expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    const calls = sandboxSpy.startProcess.mock.calls as any[][];
+    const cmd = calls[0]?.[0] as string;
+    expect(cmd).not.toContain("ANTHROPIC_AUTH_TOKEN");
+  });
+
+  it("forwards ANTHROPIC_BASE_URL when present", async () => {
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+      ANTHROPIC_AUTH_TOKEN: "sk-ant-test",
+      ANTHROPIC_BASE_URL: "https://dashscope.example.com/anthropic",
+    } as never;
+
+    await ride(env, "s1", null, {});
+
+    expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    const calls = sandboxSpy.startProcess.mock.calls as any[][];
+    const cmd = calls[0]?.[0] as string;
+    expect(cmd).toContain("ANTHROPIC_BASE_URL='https://dashscope.example.com/anthropic'");
+  });
+
+  it("omits ANTHROPIC_BASE_URL when absent", async () => {
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+      ANTHROPIC_AUTH_TOKEN: "sk-ant-test",
+    } as never;
+
+    await ride(env, "s1", null, {});
+
+    expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    const calls = sandboxSpy.startProcess.mock.calls as any[][];
+    const cmd = calls[0]?.[0] as string;
+    expect(cmd).not.toContain("ANTHROPIC_BASE_URL");
+  });
 });
 
 describe("hmacSha256", () => {
