@@ -15,9 +15,10 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git procps python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
-# koboi-agent 0.19.2 (0.19.1: POST /v1/sessions/{id}/suspend + consistent_backup; 0.19.2: GET
-# /v1/sessions/{id} survives a serve restart -- the koboi-range suspend/resume fix, PR #103).
-ARG KOBOI_AGENT_VERSION=0.19.2
+# koboi-agent 0.19.3 (0.19.2: GET /v1/sessions/{id} survives a serve restart; 0.19.3: Bitbucket
+# PR tooling + security hardening -- #91 MCP stdio attach default-deny, #99 KOBOI_API_KEYS
+# subprocess leak, #102 peer/invoke IDOR).
+ARG KOBOI_AGENT_VERSION=0.19.3
 RUN python3 -m pip install --no-cache-dir "koboi-agent[api]==${KOBOI_AGENT_VERSION}"
 
 # --- use-case code (demo: Ledgerline invoice reconciliation) -----------------
