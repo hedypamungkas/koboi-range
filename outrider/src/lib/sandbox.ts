@@ -117,6 +117,12 @@ function secretEnv(env: Env, opts?: RideOpts): string {
     parts.push(`ANTHROPIC_BASE_URL='${anthropicBaseUrl}'`);
   }
 
+  // Forward GITHUB_TOKEN when present (Path-A spike: the agent commits/pushes/opens a PR from the Mount).
+  const githubToken = (env as { GITHUB_TOKEN?: string }).GITHUB_TOKEN;
+  if (githubToken) {
+    parts.push(`GITHUB_TOKEN='${githubToken}'`);
+  }
+
   return parts.join(" ");
 }
 
@@ -302,6 +308,14 @@ export async function ride(env: Env, sessionId: string, saddlebag?: DirectoryBac
           throw new Error(`invalid baseSha: ${opts.baseSha}`);
         }
         await sb.exec(`git checkout ${opts.baseSha}`, { timeout: 60000 });
+      }
+      // Configure /workspace git for authenticated push (GitHub HTTPS) so the agent's git_push works.
+      // GITHUB_TOKEN rides the remote URL (spike-grade; production should use a credential helper).
+      // Strict URL charset so no shell metachar can reach the `remote set-url` command.
+      const ghToken = (env as { GITHUB_TOKEN?: string }).GITHUB_TOKEN;
+      if (ghToken && /^https:\/\/github\.com\/[A-Za-z0-9._\-\/]+$/.test(opts.repoUrl!)) {
+        const pushUrl = opts.repoUrl!.replace(/^https:\/\//i, `https://x-access-token:${ghToken}@`);
+        await sb.exec(`git -C ${SADDLEBAG_DIR} remote set-url origin "${pushUrl}"`, { timeout: 30000 });
       }
     }
     await waitReady(await startServe(sb, env, opts));

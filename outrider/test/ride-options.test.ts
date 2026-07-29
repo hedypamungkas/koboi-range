@@ -124,6 +124,44 @@ describe("ride options", () => {
     expect(cmd).toContain("ANTHROPIC_BASE_URL='https://dashscope.example.com/anthropic'");
   });
 
+  it("forwards GITHUB_TOKEN when present", async () => {
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+      GITHUB_TOKEN: "ghp_testtoken",
+    } as never;
+
+    await ride(env, "s1", null, {});
+
+    expect(sandboxSpy.startProcess).toHaveBeenCalledTimes(1);
+    const calls = sandboxSpy.startProcess.mock.calls as any[][];
+    const cmd = calls[0]?.[0] as string;
+    expect(cmd).toContain("GITHUB_TOKEN='ghp_testtoken'");
+  });
+
+  it("ride: sets an authenticated git remote for GitHub HTTPS push when GITHUB_TOKEN is present", async () => {
+    sandboxSpy.exec.mockClear();
+    const env = {
+      MOUNT_CONFIG: "/app/config/default.yaml",
+      PUBLIC_DOMAIN: "example.com",
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "",
+      OPENAI_MODEL: "gpt-4",
+      GITHUB_TOKEN: "ghp_testtoken",
+    } as never;
+
+    await ride(env, "s1", null, { repoUrl: "https://github.com/hedypamungkas/ragi", baseSha: "abc123" });
+
+    expect(sandboxSpy.exec).toHaveBeenCalledWith(expect.stringContaining("remote set-url origin"), expect.anything());
+    const setUrlCall = (sandboxSpy.exec.mock.calls as any[][]).find(
+      (c) => typeof c[0] === "string" && c[0].includes("remote set-url origin"),
+    );
+    expect(setUrlCall?.[0]).toContain("x-access-token:ghp_testtoken@github.com/hedypamungkas/ragi");
+  });
+
   it("omits ANTHROPIC_BASE_URL when absent", async () => {
     const env = {
       MOUNT_CONFIG: "/app/config/default.yaml",
